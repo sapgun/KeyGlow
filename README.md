@@ -21,7 +21,7 @@ Click a key in the on-screen keyboard to disable it. Click again to bring it bac
 </div>
 
 <p align="center">
-  <img src="docs/assets/keyglow-main.jpg" alt="KeyGlow main interface" width="100%" />
+  <img src="docs/assets/keyglow-main.webp" alt="KeyGlow main interface" width="100%" />
 </p>
 
 ---
