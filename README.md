@@ -275,17 +275,21 @@ When reporting keyboard-hook bugs, include:
 
 ## ❤️ Support KeyGlow
 
-If KeyGlow is useful to you, the easiest ways to support the project are:
+If KeyGlow is useful to you, you can support continued development by starring the repository, reporting reproducible bugs, contributing keyboard layouts, sharing the project, or sending a donation.
 
-- ⭐ Star the repository
-- 🐛 Report reproducible bugs
-- ⌨️ Contribute keyboard layouts
-- 📣 Share KeyGlow with other Windows keyboard users
-- ❤️ Sponsor ongoing development through GitHub Sponsors
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20KeyGlow-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/sapgun)
 
-[![Sponsor](https://img.shields.io/badge/Sponsor-KeyGlow-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/sapgun)
+### Crypto
 
-> GitHub Sponsors must be enabled on the `sapgun` account for the donation button to become an active funding destination.
+| Network / method | Donation address |
+| --- | --- |
+| Ethereum | `0xDF2930264Cf2285eB76C232b3a1233f0c5D4b471` |
+| Solana | `BzsE914REG8op1uonEv7rz2NxiS9k3Jcrivz84NdNd5H` |
+| Tether ID | `sapgun98@tether.me` |
+
+> Please verify the destination and network before sending. Crypto transfers are irreversible. For the Ethereum address, use the Ethereum network; for the Solana address, use the Solana network. Use the Tether ID only from a service that explicitly supports `tether.me` identifiers.
+
+PayPal support can be added once a public PayPal payment or PayPal.Me URL is available. A PayPal account dashboard URL is not a public donation link.
 
 ---
 
