@@ -281,11 +281,11 @@ If KeyGlow is useful to you, the easiest ways to support the project are:
 - 🐛 Report reproducible bugs
 - ⌨️ Contribute keyboard layouts
 - 📣 Share KeyGlow with other Windows keyboard users
-- ❤️ Sponsor ongoing development through GitHub Sponsors
+- ☕ Support ongoing development on Ko-fi
 
-[![Sponsor](https://img.shields.io/badge/Sponsor-KeyGlow-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/sapgun)
+[![Support on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20KeyGlow-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/sapgun)
 
-> GitHub Sponsors must be enabled on the `sapgun` account for the donation button to become an active funding destination.
+PayPal support will be added here as a second option once the project payment link is published.
 
 ---
 
