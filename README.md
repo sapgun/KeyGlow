@@ -26,12 +26,12 @@ Click a key in the on-screen keyboard to disable it. Click again to bring it bac
 
 Most keyboard software is tied to one manufacturer. KeyGlow takes a different approach: the visual controller is independent from Logitech, Razer, Keychron, Leopold, Akko, or any other specific vendor.
 
-Pick the physical layout closest to your keyboard, then control individual keys visually.
+Choose the keyboard type closest to the physical keyboard you use, then control individual keys visually.
 
 - Click a key → disable it
 - Click again → enable it
 - Press a physical key → see it light up in real time
-- Switch layouts without restarting
+- Switch keyboard types without restarting
 - Save different profiles for work, gaming, or custom setups
 - Keep everything local — no account, telemetry, or cloud required
 
@@ -54,7 +54,7 @@ A real Windows app screenshot should live here once captured from a release buil
 Recommended capture:
 
 - Window size around `1440 × 900`
-- TKL layout selected
+- `Desktop keyboard (with number pad)` selected
 - 2–3 disabled keys visible
 - One key actively highlighted if possible
 - Dark theme at 100% or 125% Windows scaling
@@ -78,19 +78,21 @@ Click any supported key directly on the keyboard graphic to toggle whether Windo
 
 Physical key-down and key-up events are reflected in the UI so the virtual keyboard behaves like a live control surface.
 
-### Multiple keyboard shapes
+### Multiple keyboard types
 
-KeyGlow separates physical layout from behavior profile.
+KeyGlow separates the physical keyboard type from the behavior profile.
 
-| Layout | Description |
+| Keyboard type | Description |
 | --- | --- |
-| Full Size | Standard desktop keyboard with numpad |
-| TKL | Full desktop layout without numpad |
-| 75% | Compact layout with F-row and arrows |
-| 65% | Compact layout with arrows, no dedicated F-row |
-| 60% | Minimal compact layout |
+| Desktop keyboard | Standard PC keyboard with a number pad |
+| Slim desktop | Desktop keyboard without a number pad |
+| Compact keyboard | Smaller layout with arrow keys and a function-key row |
+| Mini keyboard | Compact layout with arrow keys and no dedicated function-key row |
+| Laptop-style keyboard | Smallest layout, without dedicated arrow or function-key rows |
 
-Layouts are data-driven files in `src/layouts/`, so additional layouts can be added without rebuilding the renderer.
+The UI intentionally uses familiar keyboard-type names instead of enthusiast percentage labels such as TKL, 75%, 65%, or 60%.
+
+Internally, these remain data-driven layout definitions such as `fullsize-ansi`, `tkl-ansi`, `75-ansi`, `65-ansi`, and `60-ansi`, so additional keyboard types can be added without rebuilding the renderer.
 
 ### Profiles
 
@@ -267,12 +269,12 @@ Possible next steps after the Windows v0.1 foundation is stable:
 
 ## Contributing
 
-Issues, bug reports, layout contributions, UX feedback, and pull requests are welcome.
+Issues, bug reports, keyboard type/layout contributions, UX feedback, and pull requests are welcome.
 
 When reporting keyboard-hook bugs, include:
 
 - Windows version
-- keyboard layout/profile
+- keyboard type / profile
 - affected key(s)
 - whether the issue reproduces after emergency unlock
 
