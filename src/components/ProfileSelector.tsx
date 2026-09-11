@@ -44,7 +44,7 @@ export function ProfileSelector({
         <select
           value={value}
           onChange={(event) => onChange(event.target.value)}
-          className="h-9 w-44 rounded-lg border border-white/8 bg-panel-2 px-3 text-sm outline-none focus:border-lime/40"
+          className="h-9 w-44 rounded-lg border border-border bg-panel-2 px-3 text-sm outline-none focus:border-lime/40"
         >
           {profiles.map((profile) => (
             <option key={profile.id} value={profile.id}>
@@ -89,7 +89,7 @@ export function ProfileSelector({
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             placeholder={mode === "create" ? t("profileName") : t("newName")}
-            className="h-8 flex-1 rounded-md border border-white/10 bg-bg px-2 text-sm outline-none"
+            className="h-8 flex-1 rounded-md border border-border bg-bg px-2 text-sm outline-none"
           />
           <button type="submit" className="h-8 rounded-md bg-lime/20 px-3 text-xs text-lime">
             {t("save")}
@@ -118,7 +118,7 @@ function IconButton({
       title={label}
       aria-label={label}
       onClick={onClick}
-      className="grid h-9 w-8 place-items-center rounded-lg border border-white/8 bg-panel-2 text-sm text-muted hover:border-lime/30 hover:text-text"
+      className="grid h-9 w-8 place-items-center rounded-lg border border-border bg-panel-2 text-sm text-muted hover:border-lime/30 hover:text-text"
     >
       {children}
     </button>

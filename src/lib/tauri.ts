@@ -58,6 +58,10 @@ export function setLocale(locale: string) {
   return invoke<string>("set_locale", { locale });
 }
 
+export function setTheme(theme: string) {
+  return invoke<string>("set_theme", { theme });
+}
+
 function payloadCode(payload: unknown): string | null {
   if (typeof payload === "string" && payload.length > 0) {
     return payload;

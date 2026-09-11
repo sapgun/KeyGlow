@@ -22,7 +22,7 @@ export function Onboarding({ onChoose }: OnboardingProps) {
             key={layout.id}
             type="button"
             onClick={() => onChoose(layout.id)}
-            className="w-48 rounded-2xl border border-white/8 bg-panel p-4 text-left transition hover:border-lime/40 hover:bg-panel-2"
+            className="w-48 rounded-2xl border border-border bg-panel p-4 text-left transition hover:border-lime/40 hover:bg-panel-2"
           >
             <div className="text-sm font-medium">{layoutName(layout.id, locale)}</div>
             <div className="mt-1 text-xs leading-snug text-muted">
@@ -46,7 +46,7 @@ function LayoutMini({ id }: { id: string }) {
     "60": "w-[56%]",
   };
   return (
-    <div className="mt-4 h-10 rounded-md bg-black/30 p-2">
+    <div className="mt-4 h-10 rounded-md bg-overlay p-2">
       <div className={`h-full rounded-sm bg-lime/20 ${widths[id] ?? "w-2/3"}`} />
     </div>
   );

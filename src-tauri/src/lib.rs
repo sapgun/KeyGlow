@@ -94,6 +94,7 @@ pub fn run() {
             set_onboarded,
             set_start_with_windows,
             set_locale,
+            set_theme,
             show_main_window,
             get_profiles,
             select_profile,

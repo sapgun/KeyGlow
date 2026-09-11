@@ -18,6 +18,7 @@ pub struct AppSnapshot {
     pub emergency_shortcut: String,
     pub cat_lock: bool,
     pub locale: String,
+    pub theme: String,
 }
 
 #[tauri::command]
@@ -36,6 +37,7 @@ pub fn get_app_state(state: State<AppState>) -> AppSnapshot {
         emergency_shortcut: "Ctrl+Shift+F12".into(),
         cat_lock: state.controller.is_cat_locked(),
         locale: cfg.locale,
+        theme: cfg.theme,
     }
 }
 
@@ -150,6 +152,18 @@ pub fn set_locale(app: AppHandle, state: State<AppState>, locale: String) -> Res
     state.config.lock().locale = normalized.to_string();
     state.persist()?;
     crate::tray::refresh(&app);
+    Ok(normalized.to_string())
+}
+
+#[tauri::command]
+pub fn set_theme(state: State<AppState>, theme: String) -> Result<String, String> {
+    let normalized = match theme.as_str() {
+        "light" => "light",
+        "dark" => "dark",
+        _ => return Err(format!("unsupported theme: {theme}")),
+    };
+    state.config.lock().theme = normalized.to_string();
+    state.persist()?;
     Ok(normalized.to_string())
 }
 

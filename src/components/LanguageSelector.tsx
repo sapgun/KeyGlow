@@ -8,7 +8,7 @@ export function LanguageSelector() {
   const t = useT();
 
   return (
-    <div className="flex items-center rounded-lg border border-white/8 bg-panel-2 p-0.5" title={t("language")}>
+    <div className="ml-2 flex items-center rounded-lg border border-border bg-panel-2 p-0.5" title={t("language")}>
       {LOCALE_OPTIONS.map((option) => (
         <button
           key={option.id}

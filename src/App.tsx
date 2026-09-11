@@ -130,7 +130,7 @@ export default function App() {
           </div>
         )}
 
-        <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-white/5 bg-panel p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+        <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-panel p-4">
           <div className="mb-2 flex flex-shrink-0 items-center justify-between gap-3 text-[11px] uppercase tracking-[0.14em] text-muted">
             <span>
               {layoutName(layout.id, locale)}
@@ -166,13 +166,13 @@ export default function App() {
               {t("startWithWindows")}
             </label>
             <button
-              className="h-9 rounded-lg border border-white/10 bg-panel-2 px-4 text-sm hover:border-lime/30"
+              className="h-9 rounded-lg border border-border bg-panel-2 px-4 text-sm hover:border-lime/30"
               onClick={store.enableAll}
             >
               {t("enableAll")}
             </button>
             <button
-              className="h-9 rounded-lg border border-white/10 bg-panel-2 px-4 text-sm hover:border-lime/30"
+              className="h-9 rounded-lg border border-border bg-panel-2 px-4 text-sm hover:border-lime/30"
               onClick={store.resetCurrent}
             >
               {t("resetProfile")}

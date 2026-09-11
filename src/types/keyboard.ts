@@ -57,4 +57,5 @@ export interface AppSnapshot {
   emergencyShortcut: string;
   catLock: boolean;
   locale: string;
+  theme: string;
 }

@@ -1,6 +1,7 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useState } from "react";
 import { LanguageSelector } from "./LanguageSelector";
+import { ThemeToggle } from "./ThemeToggle";
 import { useT } from "../hooks/useT";
 
 export function TitleBar() {
@@ -29,7 +30,7 @@ export function TitleBar() {
   }
 
   return (
-    <div className="flex h-11 items-center border-b border-white/5 px-2">
+    <div className="flex h-11 items-center border-b border-border px-2">
       <div className="flex items-center gap-3 pl-1" data-tauri-drag-region>
         <div className="grid h-6 w-6 place-items-center rounded-md bg-lime/15 text-[11px] font-semibold text-lime">
           K
@@ -40,6 +41,7 @@ export function TitleBar() {
         </div>
       </div>
       <div className="h-full flex-1" data-tauri-drag-region />
+      <ThemeToggle />
       <LanguageSelector />
       <div className="flex items-center gap-0.5 pr-1 pl-2">
         <button className="titlebar-btn" onClick={minimize} aria-label={t("minimize")} title={t("minimize")}>

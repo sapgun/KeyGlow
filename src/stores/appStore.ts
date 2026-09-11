@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { AppSnapshot, Profile } from "../types/keyboard";
 import * as api from "../lib/tauri";
 import { detectLocale, parseLocale, type Locale } from "../i18n";
+import { applyTheme, parseTheme, readStoredTheme, type Theme } from "../lib/theme";
 
 const PRESS_TIMEOUT_MS = 8000;
 
@@ -17,6 +18,7 @@ interface AppStore {
   lastPressed: string | null;
   catLock: boolean;
   locale: Locale;
+  theme: Theme;
   onboarded: boolean;
   startWithWindows: boolean;
   deviceName: string;
@@ -36,6 +38,7 @@ interface AppStore {
   markOnboarded: (layoutId: string) => Promise<void>;
   setAutostart: (enabled: boolean) => Promise<void>;
   setLocale: (locale: Locale) => Promise<void>;
+  setTheme: (theme: Theme) => Promise<void>;
   toggleCatLock: () => Promise<void>;
   notePress: (code: string, down: boolean) => void;
   clearEmergency: () => void;
@@ -56,6 +59,7 @@ function apply(snapshot: AppSnapshot): Partial<AppStore> {
     deviceName: snapshot.deviceName,
     catLock: Boolean(snapshot.catLock),
     locale: parseLocale(snapshot.locale) ?? detectLocale(),
+    theme: parseTheme(snapshot.theme) ?? readStoredTheme(),
     error: null,
   };
 }
@@ -74,6 +78,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   lastPressed: null,
   catLock: false,
   locale: detectLocale(),
+  theme: readStoredTheme(),
   onboarded: false,
   startWithWindows: false,
   deviceName: "Generic Keyboard",
@@ -85,10 +90,15 @@ export const useAppStore = create<AppStore>((set, get) => ({
   hydrate: async () => {
     const snapshot = await api.getAppState();
     const locale = parseLocale(snapshot.locale) ?? detectLocale();
-    set({ ...apply(snapshot), locale });
+    const theme = parseTheme(snapshot.theme) ?? readStoredTheme();
+    set({ ...apply(snapshot), locale, theme });
     document.documentElement.lang = locale;
+    applyTheme(theme);
     if (!parseLocale(snapshot.locale)) {
       void api.setLocale(locale);
+    }
+    if (!parseTheme(snapshot.theme)) {
+      void api.setTheme(theme);
     }
   },
 
@@ -183,6 +193,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set({ locale });
     document.documentElement.lang = locale;
     await api.setLocale(locale);
+  },
+
+  setTheme: async (theme) => {
+    set({ theme });
+    applyTheme(theme);
+    await api.setTheme(theme);
   },
 
   notePress: (code, down) => {

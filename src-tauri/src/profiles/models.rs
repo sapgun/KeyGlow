@@ -31,6 +31,8 @@ pub struct AppConfig {
     pub start_with_windows: bool,
     #[serde(default)]
     pub locale: String,
+    #[serde(default = "default_theme")]
+    pub theme: String,
     #[serde(default)]
     pub profiles: Vec<Profile>,
 }
@@ -44,6 +46,9 @@ fn default_layout() -> String {
 fn default_profile() -> String {
     DEFAULT_PROFILE_ID.to_string()
 }
+fn default_theme() -> String {
+    "dark".to_string()
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -54,6 +59,7 @@ impl Default for AppConfig {
             onboarded: false,
             start_with_windows: false,
             locale: String::new(),
+            theme: "dark".to_string(),
             profiles: builtin_profiles(),
         }
     }
@@ -118,6 +124,9 @@ impl AppConfig {
         }
         if !matches!(self.locale.as_str(), "" | "en" | "ko" | "ja") {
             self.locale.clear();
+        }
+        if !matches!(self.theme.as_str(), "dark" | "light") {
+            self.theme = "dark".to_string();
         }
         self.version = CONFIG_VERSION;
         self

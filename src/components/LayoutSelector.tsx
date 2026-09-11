@@ -16,7 +16,7 @@ export function LayoutSelector({ value, onChange }: LayoutSelectorProps) {
       <select
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        className="h-9 max-w-xs rounded-lg border border-white/8 bg-panel-2 px-3 text-sm outline-none focus:border-lime/40"
+        className="h-9 max-w-xs rounded-lg border border-border bg-panel-2 px-3 text-sm outline-none focus:border-lime/40"
         title={layoutDescription(value, locale)}
       >
         {LAYOUTS.map((layout) => (

@@ -17,7 +17,7 @@ export function StatusBar({
 }: StatusBarProps) {
   const t = useT();
   return (
-    <div className="flex flex-shrink-0 flex-wrap items-center justify-between gap-3 border-t border-white/5 px-6 py-3 text-xs text-muted">
+    <div className="flex flex-shrink-0 flex-wrap items-center justify-between gap-3 border-t border-border px-6 py-3 text-xs text-muted">
       <div className="flex items-center gap-4">
         <span className="inline-flex items-center gap-2">
           <span
