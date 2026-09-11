@@ -20,6 +20,10 @@ Click a key in the on-screen keyboard to disable it. Click again to bring it bac
 
 </div>
 
+<p align="center">
+  <img src="docs/assets/keyglow-main.jpg" alt="KeyGlow main interface" width="100%" />
+</p>
+
 ---
 
 ## Why KeyGlow?
@@ -46,27 +50,6 @@ KeyGlow is designed around one simple mental model:
 | 🟢 Glowing | Key is enabled |
 | ✨ Bright / pressed | Physical key is currently being pressed |
 | ⚫ Dark | Key is disabled |
-
-### Screenshot
-
-A real Windows app screenshot should live here once captured from a release build.
-
-Recommended capture:
-
-- Window size around `1440 × 900`
-- `Desktop keyboard (with number pad)` selected
-- 2–3 disabled keys visible
-- One key actively highlighted if possible
-- Dark theme at 100% or 125% Windows scaling
-- Save as `docs/assets/keyglow-main.png`
-
-Then replace this note with:
-
-```html
-<p align="center">
-  <img src="docs/assets/keyglow-main.png" alt="KeyGlow main interface" width="100%" />
-</p>
-```
 
 ## Features
 
