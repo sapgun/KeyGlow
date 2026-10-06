@@ -25,7 +25,7 @@ pub struct AppState {
     /// critical section, so concurrent commands can never interleave their
     /// writes. Lock order is always persist_lock -> config lock, never the
     /// reverse (commands must not hold persist_lock across persist()).
-    persist_lock: Mutex<()>,
+    pub(crate) persist_lock: Mutex<()>,
     /// Incremented after every successful persist.
     pub persisted_revision: AtomicU64,
     /// Last persist failure, if the on-disk config is stale.
