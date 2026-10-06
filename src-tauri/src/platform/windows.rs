@@ -1,9 +1,9 @@
 use crate::keyboard::engine::{FilterEngine, KeyboardController};
 use crate::keyboard::hook::{start_hook, HookEvent, HookHandle};
-use crate::keyboard::KeyCode;
+use crate::keyboard::{KeyCode, SafetyState};
 use crate::platform::ControllerStart;
 use parking_lot::Mutex;
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::Arc;
 
 pub struct WindowsController {
@@ -48,12 +48,15 @@ pub fn start(
     engine: Arc<Mutex<FilterEngine>>,
     tx: SyncSender<HookEvent>,
     rx: Receiver<HookEvent>,
+    safety: Arc<SafetyState>,
+    safety_wake_tx: Sender<()>,
+    safety_wake_rx: Receiver<()>,
 ) -> ControllerStart {
     let controller = Arc::new(WindowsController {
         engine: engine.clone(),
     });
 
-    match start_hook(engine, tx) {
+    match start_hook(engine, tx, safety.clone(), safety_wake_tx) {
         Ok(handle) => {
             let shutdown_slot: Arc<Mutex<Option<HookHandle>>> = Arc::new(Mutex::new(Some(handle)));
             let shutdown_slot_clone = shutdown_slot.clone();
@@ -67,6 +70,8 @@ pub fn start(
                         handle.shutdown();
                     }
                 }),
+                safety,
+                safety_wake: safety_wake_rx,
             }
         }
         Err(err) => {
@@ -77,6 +82,8 @@ pub fn start(
                 hook_active: false,
                 hook_error: Some(err),
                 shutdown: Arc::new(|| {}),
+                safety,
+                safety_wake: safety_wake_rx,
             }
         }
     }

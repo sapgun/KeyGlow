@@ -20,6 +20,7 @@ KeyGlow
 │   ├── keyboard/keycodes.rs   stable IDs ↔ Windows VK/scan
 │   ├── keyboard/engine.rs     enable/disable + stuck-key state machine
 │   ├── keyboard/hook.rs       WH_KEYBOARD_LL callback + hook thread
+│   ├── keyboard/safety.rs     emergency-unlock safety epoch + claim
 │   ├── profiles/              JSON persistence
 │   └── commands/              IPC
 │
@@ -67,14 +68,18 @@ Each key tracks:
 
 ## Emergency unlock
 
-`Ctrl + Shift + F12` is evaluated from **physical** down state, even if those keys are disabled. Completing the chord:
+`Ctrl + Shift + F12` is evaluated from **physical** down state, even if those keys are disabled. The chord itself cannot be turned off in a profile. Completing the chord:
 
-1. `enable_all()` inside the hook
-2. emit `keyboard:emergency-unlock` on the event thread
-3. switch to the Default profile and clear its disabled list
-4. persist settings
+1. `enable_all()` inside the hook — physical input recovers immediately, on the hook thread.
+2. The hook bumps the **safety epoch** (one atomic increment) and wakes the safety worker over an unbounded channel. No blocking sends, no file or UI work in the callback.
+3. The **safety worker** (`keyglow-safety` thread) converges config + controller + persist on its own thread, then posts UI/tray updates to the main thread. It claims each epoch exactly once, so rapid repeated presses coalesce and a delayed UI thread can never lose the unlock.
+4. The `EmergencyUnlock` queue event is only a best-effort UI hint now: if the event queue is saturated and drops it, the epoch latch is authoritative. The event pump keeps an exactly-once fallback claim in case the worker is gone.
 
-The chord itself cannot be turned off in a profile.
+Converged state: Default profile selected, its disabled list cleared, all keys enabled, settings persisted (best-effort: a persist failure is logged but never re-blocks input), UI notice + tray refreshed.
+
+### Stale commands after emergency
+
+Mutating commands (`set_key_enabled`, `enable_all_keys`, `set_cat_lock`, profile select/create/duplicate/delete/reset) record the safety epoch on entry and re-check it after mutating and after persisting. If an emergency press landed in between, the command's intent is discarded and the safe state is force re-asserted (controller + config + persist + UI/tray), so a stale profile/key-disable command can never re-disable keys after the unlock — including on the next launch (a stale write that raced the worker's persist is repaired, not left on disk).
 
 ## Profiles
 
@@ -86,6 +91,8 @@ Stored as JSON. Layout and disabled-key set are separate fields. Built-in profil
 
 ## Concurrency
 
-- Hook callback: `parking_lot::Mutex<FilterEngine>` held only for the decision
-- Events: `sync_channel(256)` + `try_send` (drops if the UI is stuck; input is never delayed)
-- Persistence: only from command/event threads, never from the hook
+- Hook callback: `parking_lot::Mutex<FilterEngine>` held only for the decision. On emergency the callback additionally performs exactly one atomic epoch increment, one non-blocking wake send, and one `try_send` — never file, network, UI, or blocking channel work.
+- Events: `sync_channel(1024)` + `try_send` (drops if the UI is stuck; input is never delayed). Key down/up pulses are lossy by design; the emergency signal is not — it rides the safety epoch latch.
+- Safety wake: unbounded `mpsc::channel::<()>`; `send` from the hook never blocks.
+- Persistence: only from command/event/safety-worker threads, never from the hook.
+- Convergence exactly-once: `SafetyState::claim_reconcile(epoch)` elects a single converger per epoch across the safety worker, the event pump fallback, and stale-command repair.

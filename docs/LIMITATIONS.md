@@ -34,6 +34,10 @@ KeyGlow filters injected events the same way as physical ones. It does not injec
 
 Disabled keys persist **inside KeyGlow profiles**. They do not persist as a Windows-wide remap after the app exits.
 
+## Hook lifecycle
+
+The keyboard hook is installed once at startup and removed at exit. Restarting the hook inside a running process is not supported. Thread liveness alone does not prove the OS still delivers hook callbacks; if filtering silently stops, restart the app.
+
 ## Next recommended improvements
 
 1. Per-device filtering via Raw Input (`GetRawInputDeviceList` + device handle on `RAWINPUT`)

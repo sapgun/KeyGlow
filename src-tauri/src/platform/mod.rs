@@ -1,6 +1,6 @@
 use crate::keyboard::engine::KeyboardController;
 use crate::keyboard::hook::HookEvent;
-use crate::keyboard::FilterEngine;
+use crate::keyboard::{FilterEngine, SafetyState};
 use parking_lot::Mutex;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -14,27 +14,39 @@ pub struct ControllerStart {
     pub hook_active: bool,
     pub hook_error: Option<String>,
     pub shutdown: Arc<dyn Fn() + Send + Sync>,
+    /// Shared safety epoch for emergency unlock (HF-01). Bumped by the hook
+    /// thread, converged by the safety worker; also serializes mutating
+    /// commands against stale post-emergency writes.
+    pub safety: Arc<SafetyState>,
+    /// Wake receiver for the safety worker. Unbounded channel: the hook
+    /// never blocks on it.
+    pub safety_wake: Receiver<()>,
 }
 
 pub fn start_input_backend() -> ControllerStart {
     let engine = Arc::new(Mutex::new(FilterEngine::new()));
     let (tx, rx) = std::sync::mpsc::sync_channel(1024);
+    let safety = Arc::new(SafetyState::new());
+    let (safety_wake_tx, safety_wake_rx) = std::sync::mpsc::channel::<()>();
 
     #[cfg(windows)]
     {
-        windows::start(engine, tx, rx)
+        windows::start(engine, tx, rx, safety, safety_wake_tx, safety_wake_rx)
     }
 
     #[cfg(not(windows))]
     {
         let controller = Arc::new(UnsupportedController { engine });
         let _ = tx;
+        drop(safety_wake_tx);
         ControllerStart {
             controller,
             events: rx,
             hook_active: false,
             hook_error: Some("KeyGlow v0.1 supports Windows only".into()),
             shutdown: Arc::new(|| {}),
+            safety,
+            safety_wake: safety_wake_rx,
         }
     }
 }
