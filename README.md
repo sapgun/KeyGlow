@@ -183,6 +183,16 @@ Run all tests:
 npm run test:all
 ```
 
+### Continuous integration
+
+Every push to `main` (and PRs) runs `.github/workflows/ci.yml` on
+`windows-latest`: version consistency check (package.json / Cargo.toml /
+tauri.conf.json), `npm ci` → `npm test` → `npm run test:rust` →
+`npm run build`, then a full `tauri build` producing the NSIS installer
+and portable exe with SHA256 sums uploaded as artifacts. The workflow
+never publishes a release on its own — see `docs/RELEASE-DRAFT.md` for
+the manual release gates.
+
 ## Build for Windows
 
 ```bash
