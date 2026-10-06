@@ -1,8 +1,9 @@
 use super::engine::{FilterEngine, HookDecision, UiPulse};
 use super::keycodes::{identify_key, KeyCode};
+use super::safety::SafetyState;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{Sender, SyncSender};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 
@@ -10,12 +11,20 @@ use std::thread::{self, JoinHandle};
 pub enum HookEvent {
     KeyDown { code: KeyCode },
     KeyUp { code: KeyCode },
-    EmergencyUnlock,
+    /// Best-effort UI hint. The safety epoch on [`SafetyState`] is the
+    /// authoritative signal: if this event is dropped by a saturated queue,
+    /// the safety worker still converges from the epoch latch.
+    EmergencyUnlock { epoch: u64 },
 }
 
 struct HookShared {
     engine: Arc<Mutex<FilterEngine>>,
     tx: SyncSender<HookEvent>,
+    safety: Arc<SafetyState>,
+    /// Wake channel for the safety worker. Unbounded: `send` never blocks
+    /// and only fails after the worker is gone (shutdown), so the hook
+    /// callback never waits on any queue.
+    safety_wake: Sender<()>,
 }
 
 static SHARED: OnceLock<HookShared> = OnceLock::new();
@@ -62,8 +71,15 @@ fn shutdown_hook_thread(thread_id: u32) {
 pub fn start_hook(
     engine: Arc<Mutex<FilterEngine>>,
     tx: SyncSender<HookEvent>,
+    safety: Arc<SafetyState>,
+    safety_wake: Sender<()>,
 ) -> Result<HookHandle, String> {
-    let _ = SHARED.set(HookShared { engine, tx });
+    let _ = SHARED.set(HookShared {
+        engine,
+        tx,
+        safety,
+        safety_wake,
+    });
 
     #[cfg(not(windows))]
     {
@@ -111,7 +127,16 @@ fn start_windows_hook() -> Result<HookHandle, String> {
                         None => {}
                     }
                     if result.emergency {
-                        let _ = shared.tx.try_send(HookEvent::EmergencyUnlock);
+                        // Physical recovery (enable_all) already happened
+                        // inside the engine. Here the hook only records the
+                        // safety epoch (one atomic increment) and wakes the
+                        // worker: no blocking sends, no file or UI work.
+                        let epoch = shared.safety.trigger();
+                        let _ = shared.safety_wake.send(());
+                        // UI hint on the lossy glow queue; safe to drop.
+                        let _ = shared
+                            .tx
+                            .try_send(HookEvent::EmergencyUnlock { epoch });
                     }
                     if result.decision == HookDecision::Consume {
                         return 1;
