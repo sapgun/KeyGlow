@@ -135,3 +135,40 @@ With the Default profile (all enabled), confirm no regression:
 Switch language to KO and JA, then repeat Test 10 step 2. Expected: the
 banner header and Retry button are translated; only the technical detail
 stays in English.
+
+## Test 13 — Long hold keeps its glow (HF-04)
+
+1. Open Notepad (or any other app) and hold the `A` key for 12 seconds.
+   Expected: the KeyGlow window keeps `A` lit the whole time. It must NOT
+   go dark at 8 seconds while the key is still physically held.
+2. While still holding, note the keycap style: after ~8s it briefly shows a
+   dashed "verifying hold" pulse, then returns to the normal pressed glow.
+   Expected: no stuck dark key, no flicker loop.
+3. Release the key. Expected: the glow clears within a second.
+
+## Test 14 — Dropped key-up recovery (HF-04)
+
+1. Hold a key in an external app, then hide the KeyGlow window
+   (close to tray) and release the key.
+2. Restore the window. Expected: no ghost pressed key remains; if the key
+   is still physically held, it shows pressed, otherwise it is clear.
+3. Put the machine to sleep with a key held, wake it, release the key.
+   Expected: the pressed state resynchronizes on wake; no permanently lit
+   key.
+
+## Test 15 — Rapid toggle converges (HF-05)
+
+1. Double-click (or triple-click) the same key as fast as possible.
+   Expected: the final key state always matches the last click; the UI
+   never ends up inverted because an older response arrived late.
+2. Trigger emergency unlock while a toggle request is still in flight.
+   Expected: the unlock wins; the late toggle response does not re-disable
+   the key.
+
+## Test 16 — Event subscription failure (HF-09)
+
+1. (Code review / fault injection) Make one Tauri event subscription fail.
+   Expected: the listeners that did register are unlistened again (no
+   leak), and a translated banner explains that live key display may not
+   update.
+2. In all three languages (EN/KO/JA), check the banner text renders.

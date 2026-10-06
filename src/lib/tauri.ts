@@ -1,9 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AppSnapshot, Profile } from "../types/keyboard";
+import type { AppSnapshot, PressedSnapshot, Profile } from "../types/keyboard";
 
 export function getAppState() {
   return invoke<AppSnapshot>("get_app_state");
+}
+
+export function getPressedSnapshot() {
+  return invoke<PressedSnapshot>("get_pressed_snapshot");
 }
 
 export function setKeyEnabled(code: string, enabled: boolean) {

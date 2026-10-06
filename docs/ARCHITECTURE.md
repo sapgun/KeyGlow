@@ -144,3 +144,37 @@ physical input state is never rolled back because the disk write failed.
   succeeds. Restart loads the last good file from disk.
 - Emergency unlock and Enable-All are never cancelled by a persist
   failure: physical input recovery is unconditional (HF-01 contract).
+
+## Pressed-state sync (HF-04)
+
+- The 8-second UI timer is NOT a release timer anymore. After 8s without a
+  key-up, the UI marks the key stale (dashed pulse + "verifying hold" label)
+  and queries the native pressed snapshot (`get_pressed_snapshot` IPC).
+- The native side exposes `FilterEngine::pressed_keys()` (the hook's
+  `physical_down` array) and a per-event `event_seq` sequence number through
+  the `KeyboardController` trait. The snapshot is authoritative; the event
+  channel stays lossy for glow hints.
+- Native confirmation keeps the glow and re-arms the check; a native
+  "released" answer clears it. A failed query keeps the glow and retries:
+  the UI never drops a physically held key on suspicion.
+- `resyncPressed()` reconciles on window focus, visibility change, and
+  after emergency unlock — the moments key-up events are most likely lost.
+- Repeat events are still not emitted by the engine (first-down pulse
+  only); long holds are covered by the stale-check loop instead.
+
+## Command revision guard (HF-05)
+
+- Every mutating store command takes a monotonically increasing revision
+  (`cmdRev`) when it starts and applies its response only if no newer
+  command began meanwhile. Rapid double-clicks therefore always converge to
+  the latest click; a late response can never overwrite fresher state.
+- `showEmergency()` invalidates all in-flight commands, mirroring the
+  native `discard_stale_command` at the UI layer: a stale toggle response
+  can never undo an emergency unlock.
+- Authoritative snapshots (`hydrate`, native `state-changed` events) bypass
+  the guard — they are the truth, not a guess.
+- `setLocale`/`setTheme`/`setAutostart` roll back to the previous value on
+  failure (HF-03 pattern reused).
+- Event subscription uses `Promise.allSettled`: a single failing listener
+  no longer leaks the already-registered ones, and the failure is shown in
+  a translated banner (HF-09 follow-up).

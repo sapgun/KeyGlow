@@ -42,6 +42,14 @@ impl KeyboardController for WindowsController {
     fn is_cat_locked(&self) -> bool {
         self.engine.lock().is_cat_locked()
     }
+
+    fn pressed_keys(&self) -> Vec<KeyCode> {
+        self.engine.lock().pressed_keys()
+    }
+
+    fn event_sequence(&self) -> u64 {
+        self.engine.lock().event_sequence()
+    }
 }
 
 pub fn start(

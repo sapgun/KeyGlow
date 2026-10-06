@@ -174,6 +174,7 @@ pub fn run() {
             delete_profile,
             reset_profile,
             retry_persist,
+            get_pressed_snapshot,
         ])
         .setup(|app| {
             let path = match app.path().app_config_dir() {

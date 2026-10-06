@@ -6,11 +6,12 @@ interface KeyboardProps {
   layout: KeyboardLayout;
   disabledKeys: string[];
   pressedKeys: string[];
+  staleKeys?: string[];
   catLock?: boolean;
   onToggle: (code: string) => void;
 }
 
-export function Keyboard({ layout, disabledKeys, pressedKeys, catLock, onToggle }: KeyboardProps) {
+export function Keyboard({ layout, disabledKeys, pressedKeys, staleKeys, catLock, onToggle }: KeyboardProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [box, setBox] = useState({ w: 1100, h: 420 });
 
@@ -48,12 +49,14 @@ export function Keyboard({ layout, disabledKeys, pressedKeys, catLock, onToggle 
         {layout.keys.map((keyDef) => {
           const disabled = Boolean(catLock) || disabledKeys.includes(keyDef.code);
           const pressed = pressedKeys.includes(keyDef.code);
+          const stale = pressed && (staleKeys ?? []).includes(keyDef.code);
           const state = pressed ? "pressed" : disabled ? "disabled" : "enabled";
           return (
             <KeyboardKey
               key={`${keyDef.code}:${keyDef.x}:${keyDef.y}`}
               keyDef={keyDef}
               state={state}
+              stale={stale}
               unit={unit}
               gap={gap}
               onToggle={onToggle}
