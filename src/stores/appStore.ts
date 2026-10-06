@@ -24,6 +24,10 @@ interface AppStore {
   deviceName: string;
   emergencyNotice: boolean;
   error: string | null;
+  persisted: boolean;
+  persistError: string | null;
+  persistErrorKind: string | null;
+  configRevision: number;
   hydrate: () => Promise<void>;
   applySnapshot: (snapshot: AppSnapshot) => void;
   toggleKey: (code: string) => Promise<void>;
@@ -40,6 +44,7 @@ interface AppStore {
   setLocale: (locale: Locale) => Promise<void>;
   setTheme: (theme: Theme) => Promise<void>;
   toggleCatLock: () => Promise<void>;
+  retryPersist: () => Promise<void>;
   notePress: (code: string, down: boolean) => void;
   clearEmergency: () => void;
   showEmergency: () => void;
@@ -61,12 +66,31 @@ function apply(snapshot: AppSnapshot): Partial<AppStore> {
     locale: parseLocale(snapshot.locale) ?? detectLocale(),
     theme: parseTheme(snapshot.theme) ?? readStoredTheme(),
     error: null,
+    persisted: snapshot.persisted,
+    persistError: snapshot.persistError,
+    persistErrorKind: snapshot.persistErrorKind,
+    configRevision: snapshot.configRevision,
   };
 }
 
 const pressTimers = new Map<string, number>();
 
-export const useAppStore = create<AppStore>((set, get) => ({
+export const useAppStore = create<AppStore>((set, get) => {
+  // Shared failure path (HF-03): refresh the authoritative snapshot so the
+  // UI shows the real applied state, then surface the error. The snapshot
+  // also carries the sticky persist state (persisted/persistError), so an
+  // unsaved-settings banner survives until a retry succeeds. No rejected
+  // promise ever escapes a store action.
+  const fail = async (err: unknown) => {
+    try {
+      const snapshot = await api.getAppState();
+      set({ ...apply(snapshot), error: String(err) });
+    } catch {
+      set({ error: String(err) });
+    }
+  };
+
+  return {
   hydrated: false,
   hookActive: false,
   hookError: null,
@@ -84,9 +108,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
   deviceName: "Generic Keyboard",
   emergencyNotice: false,
   error: null,
+  persisted: true,
+  persistError: null,
+  persistErrorKind: null,
+  configRevision: 0,
 
   applySnapshot: (snapshot) => set(apply(snapshot)),
-
   hydrate: async () => {
     const snapshot = await api.getAppState();
     const locale = parseLocale(snapshot.locale) ?? detectLocale();
@@ -95,10 +122,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
     document.documentElement.lang = locale;
     applyTheme(theme);
     if (!parseLocale(snapshot.locale)) {
-      void api.setLocale(locale);
+      void api.setLocale(locale).catch(() => {});
     }
     if (!parseTheme(snapshot.theme)) {
-      void api.setTheme(theme);
+      void api.setTheme(theme).catch(() => {});
     }
   },
 
@@ -115,14 +142,17 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const keys = await api.setKeyEnabled(code, nextEnabled);
       set({ disabledKeys: keys, error: null });
     } catch (err) {
-      const snapshot = await api.getAppState();
-      set({ ...apply(snapshot), error: String(err) });
+      await fail(err);
     }
   },
 
   enableAll: async () => {
-    const keys = await api.enableAllKeys();
-    set({ disabledKeys: keys, catLock: false });
+    try {
+      const keys = await api.enableAllKeys();
+      set({ disabledKeys: keys, catLock: false, error: null });
+    } catch (err) {
+      await fail(err);
+    }
   },
 
   toggleCatLock: async () => {
@@ -130,75 +160,143 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set({ catLock: next });
     try {
       const locked = await api.setCatLock(next);
-      set({ catLock: locked });
+      set({ catLock: locked, error: null });
     } catch (err) {
-      set({ catLock: !next, error: String(err) });
+      set({ catLock: !next });
+      await fail(err);
     }
   },
 
   chooseLayout: async (id) => {
-    await api.selectLayout(id);
-    set({ layoutId: id, onboarded: true });
+    try {
+      await api.selectLayout(id);
+      set({ layoutId: id, onboarded: true, error: null });
+    } catch (err) {
+      await fail(err);
+    }
   },
 
   chooseProfile: async (id) => {
-    await api.selectProfile(id);
-    const snapshot = await api.getAppState();
-    set(apply(snapshot));
+    try {
+      await api.selectProfile(id);
+      const snapshot = await api.getAppState();
+      set(apply(snapshot));
+    } catch (err) {
+      await fail(err);
+    }
   },
 
   newProfile: async (name) => {
-    await api.createProfile(name);
-    const snapshot = await api.getAppState();
-    set(apply(snapshot));
+    try {
+      await api.createProfile(name);
+      const snapshot = await api.getAppState();
+      set(apply(snapshot));
+    } catch (err) {
+      await fail(err);
+    }
   },
 
   copyProfile: async () => {
-    await api.duplicateProfile(get().profileId);
-    const snapshot = await api.getAppState();
-    set(apply(snapshot));
+    try {
+      await api.duplicateProfile(get().profileId);
+      const snapshot = await api.getAppState();
+      set(apply(snapshot));
+    } catch (err) {
+      await fail(err);
+    }
   },
 
   renameCurrent: async (name) => {
-    await api.renameProfile(get().profileId, name);
-    const snapshot = await api.getAppState();
-    set(apply(snapshot));
+    try {
+      await api.renameProfile(get().profileId, name);
+      const snapshot = await api.getAppState();
+      set(apply(snapshot));
+    } catch (err) {
+      await fail(err);
+    }
   },
 
   removeProfile: async (id) => {
-    await api.deleteProfile(id);
-    const snapshot = await api.getAppState();
-    set(apply(snapshot));
+    try {
+      await api.deleteProfile(id);
+      const snapshot = await api.getAppState();
+      set(apply(snapshot));
+    } catch (err) {
+      await fail(err);
+    }
   },
 
   resetCurrent: async () => {
-    await api.resetProfile(get().profileId);
-    const snapshot = await api.getAppState();
-    set(apply(snapshot));
+    try {
+      await api.resetProfile(get().profileId);
+      const snapshot = await api.getAppState();
+      set(apply(snapshot));
+    } catch (err) {
+      await fail(err);
+    }
   },
 
   markOnboarded: async (layoutId) => {
-    await api.selectLayout(layoutId);
-    await api.setOnboarded(true);
-    const snapshot = await api.getAppState();
-    set(apply(snapshot));
+    try {
+      await api.selectLayout(layoutId);
+      await api.setOnboarded(true);
+      const snapshot = await api.getAppState();
+      set(apply(snapshot));
+    } catch (err) {
+      await fail(err);
+    }
   },
 
   setAutostart: async (enabled) => {
-    await api.setStartWithWindows(enabled);
+    const prev = get().startWithWindows;
     set({ startWithWindows: enabled });
+    try {
+      await api.setStartWithWindows(enabled);
+      set({ error: null });
+    } catch (err) {
+      set({ startWithWindows: prev });
+      await fail(err);
+    }
   },
 
   setLocale: async (locale) => {
+    const prev = get().locale;
     set({ locale });
     document.documentElement.lang = locale;
-    await api.setLocale(locale);
+    try {
+      await api.setLocale(locale);
+      set({ error: null });
+    } catch (err) {
+      // Rollback: the persisted locale is still `prev`.
+      set({ locale: prev });
+      document.documentElement.lang = prev;
+      await fail(err);
+    }
   },
 
   setTheme: async (theme) => {
+    const prev = get().theme;
     set({ theme });
     applyTheme(theme);
-    await api.setTheme(theme);
+    try {
+      await api.setTheme(theme);
+      set({ error: null });
+    } catch (err) {
+      // Rollback: the persisted theme is still `prev`.
+      set({ theme: prev });
+      applyTheme(prev);
+      await fail(err);
+    }
+  },
+
+  retryPersist: async () => {
+    try {
+      await api.retryPersist();
+      const snapshot = await api.getAppState();
+      set(apply(snapshot));
+    } catch (err) {
+      await fail(err);
+    }
   },
 
   notePress: (code, down) => {
@@ -229,4 +327,5 @@ export const useAppStore = create<AppStore>((set, get) => ({
       profileId: "default",
       catLock: false,
     }),
-}));
+  };
+});

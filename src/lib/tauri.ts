@@ -46,6 +46,10 @@ export function resetProfile(id: string) {
   return invoke<Profile>("reset_profile", { id });
 }
 
+export function retryPersist() {
+  return invoke<void>("retry_persist", {});
+}
+
 export function setOnboarded(onboarded: boolean) {
   return invoke<void>("set_onboarded", { onboarded });
 }
