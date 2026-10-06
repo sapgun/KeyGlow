@@ -104,3 +104,34 @@ With the Default profile (all enabled), confirm no regression:
 - Disable Left Shift while holding it, then release. Shift must not stick.
 - Hide the window with the close button; the app stays in the tray and filtering stays active.
 - Open a second KeyGlow instance; it should focus the existing window (single instance).
+
+## Test 10 — Settings survive a failed write (HF-02/HF-03)
+
+1. Make the settings file unwritable (e.g. revoke write permission on
+   `%APPDATA%\KeyGlow\settings.json`, or point the app at a read-only
+   location).
+2. Disable a key in the UI. Expected: the key is disabled in the running
+   app, and a settings error banner appears with the failure reason plus
+   **Retry** and **Enable All** actions.
+3. Press **Retry** after restoring write permission. Expected: the banner
+   clears and the file on disk matches the UI state.
+4. With the file still unwritable, trigger emergency unlock
+   (Ctrl+Shift+F12). Expected: all keys work immediately; the unlock is
+   NOT cancelled by the failed write. The banner remains until Retry.
+
+## Test 11 — Profile activation keeps layout in sync (HF-06)
+
+1. Select the Gaming profile, then duplicate it. Expected: the copy is
+   selected and the layout selector shows the copy's layout (not the
+   previous one).
+2. Rapidly create two profiles with the same name. Expected: two distinct
+   ids, no collision.
+3. Quit, delete the Default profile entry from `settings.json` by hand,
+   and restart. Expected: the app starts with a restored Default profile;
+   no crash, no empty profile list.
+
+## Test 12 — Settings error banner languages (HF-03)
+
+Switch language to KO and JA, then repeat Test 10 step 2. Expected: the
+banner header and Retry button are translated; only the technical detail
+stays in English.
