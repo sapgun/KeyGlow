@@ -11,7 +11,7 @@ use keyboard::hook::HookEvent;
 use keyboard::SafetyState;
 use platform::start_input_backend;
 use state::AppState;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -173,6 +173,7 @@ pub fn run() {
             rename_profile,
             delete_profile,
             reset_profile,
+            retry_persist,
         ])
         .setup(|app| {
             let path = match app.path().app_config_dir() {
@@ -210,6 +211,10 @@ pub fn run() {
                 hook_error: parking_lot::Mutex::new(backend.hook_error),
                 shutdown: backend.shutdown,
                 safety: backend.safety.clone(),
+                persist_lock: parking_lot::Mutex::new(()),
+                persisted_revision: AtomicU64::new(0),
+                persist_error: parking_lot::Mutex::new(None),
+                persist_error_kind: parking_lot::Mutex::new(None),
             });
 
             spawn_event_pump(app.handle().clone(), backend.events);
