@@ -7,7 +7,8 @@ mod state;
 mod tray;
 
 use commands::*;
-use keyboard::hook::{HookEvent, HookExit};
+use keyboard::hook::HookEvent;
+use keyboard::hook_lifecycle::HookExit;
 use keyboard::SafetyState;
 use platform::start_input_backend;
 use state::AppState;
