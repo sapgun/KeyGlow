@@ -66,4 +66,43 @@ export interface AppSnapshot {  hookActive: boolean;
   persistError: string | null;
   persistErrorKind: string | null;
   configRevision: number;
+  /** Latest emergency epoch recorded by native at snapshot time (P3). */
+  safetyEpoch: number;
+  /** Highest emergency epoch fully converged at snapshot time (P3). */
+  safetyReconciled: number;
+  /**
+   * Monotonic runtime-state revision (P3). Orders runtime state for the
+   * UI; deliberately distinct from configRevision, which only tracks
+   * successful disk writes. Never compare the two against each other.
+   */
+  runtimeRevision: number;
+}
+
+/**
+ * Ordering envelope on state-affecting native events (P3). The UI applies
+ * an event only when (safetyEpoch, runtimeRevision) is not older than what
+ * it already shows.
+ */
+export interface StateChangedPayload {
+  keys: string[];
+  safetyEpoch: number;
+  runtimeRevision: number;
+}
+
+export interface CatLockPayload {
+  locked: boolean;
+  safetyEpoch: number;
+  runtimeRevision: number;
+}
+
+/** Emitted only after an emergency epoch fully converged (P3). */
+export interface EmergencyPayload {
+  epoch: number;
+  runtimeRevision: number;
+}
+
+/** Physical key event with the native event sequence (P3). */
+export interface KeyPressPayload {
+  code: string;
+  seq: number;
 }

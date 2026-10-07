@@ -1,6 +1,7 @@
 use crate::profiles::{Profile, DEFAULT_PROFILE_ID};
 use crate::state::{parse_key_ids, AppState};
 use crate::tray;
+use super::keyboard::state_changed_payload;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, State};
@@ -18,6 +19,8 @@ pub fn select_profile(app: AppHandle, state: State<AppState>, id: String) -> Res
         // Common activation policy (HF-06): selection syncs selected_layout.
         cfg.activate_profile(&id)?;
     }
+    // Order this mutation for the UI (P3).
+    state.bump_runtime_revision();
     if state.safety.epoch() != entered {
         // Stale selection must not re-apply a disabled set after the unlock.
         crate::discard_stale_command(&app, &state, "superseded mid-command");
@@ -37,7 +40,7 @@ pub fn select_profile(app: AppHandle, state: State<AppState>, id: String) -> Res
         .cloned()
         .ok_or_else(|| "profile missing after select".to_string())?;
     let _ = app.emit("profile:changed", state.config.lock().clone());
-    let _ = app.emit("keyboard:state-changed", state.snapshot_disabled());
+    let _ = app.emit("keyboard:state-changed", state_changed_payload(&state));
     tray::refresh(&app);
     Ok(profile)
 }
@@ -82,6 +85,7 @@ pub fn create_profile(
         // Common activation policy (HF-06).
         cfg.activate_profile(&id)?;
     }
+    state.bump_runtime_revision();
     if state.safety.epoch() != entered {
         // The profile itself is harmless (no disabled keys); only the
         // selection is reverted to the safe state.
@@ -132,6 +136,7 @@ pub fn duplicate_profile(
         // showed the source's old layout context.
         cfg.activate_profile(&copy_id)?;
     }
+    state.bump_runtime_revision();
     if state.safety.epoch() != entered {
         // A stale duplicate may carry a disabled set; never apply it after
         // the unlock. The copy itself stays in the list, unselected.
@@ -167,6 +172,7 @@ pub fn rename_profile(
             .ok_or_else(|| format!("unknown profile: {id}"))?;
         profile.name = name;
     }
+    state.bump_runtime_revision();
     state.persist()?;
     let profile = state
         .config
@@ -200,6 +206,7 @@ pub fn delete_profile(app: AppHandle, state: State<AppState>, id: String) -> Res
             let _ = cfg.activate_profile(DEFAULT_PROFILE_ID);
         }
     }
+    state.bump_runtime_revision();
     if state.safety.epoch() != entered {
         crate::discard_stale_command(&app, &state, "superseded mid-command");
         return Ok(());
@@ -211,7 +218,7 @@ pub fn delete_profile(app: AppHandle, state: State<AppState>, id: String) -> Res
         return Ok(());
     }
     let _ = app.emit("profile:changed", state.config.lock().clone());
-    let _ = app.emit("keyboard:state-changed", state.snapshot_disabled());
+    let _ = app.emit("keyboard:state-changed", state_changed_payload(&state));
     tray::refresh(&app);
     Ok(())
 }
@@ -230,6 +237,7 @@ pub fn reset_profile(app: AppHandle, state: State<AppState>, id: String) -> Resu
             profile.disabled_keys.clear();
         }
     }
+    state.bump_runtime_revision();
     if state.safety.epoch() != entered {
         // A stale reset must not re-apply a disabled set after the unlock.
         crate::discard_stale_command(&app, &state, "superseded mid-command");
@@ -256,7 +264,7 @@ pub fn reset_profile(app: AppHandle, state: State<AppState>, id: String) -> Resu
         .cloned()
         .ok_or_else(|| "profile missing after reset".to_string())?;
     let _ = app.emit("profile:changed", state.config.lock().clone());
-    let _ = app.emit("keyboard:state-changed", state.snapshot_disabled());
+    let _ = app.emit("keyboard:state-changed", state_changed_payload(&state));
     Ok(profile)
 }
 
