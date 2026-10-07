@@ -9,8 +9,12 @@ use std::thread::{self, JoinHandle};
 
 #[derive(Debug, Clone, Copy)]
 pub enum HookEvent {
-    KeyDown { code: KeyCode },
-    KeyUp { code: KeyCode },
+    /// Physical key press. `seq` is the engine's event sequence for this
+    /// press (P3): the UI orders key events against pressed-snapshot
+    /// responses with it.
+    KeyDown { code: KeyCode, seq: u64 },
+    /// Physical key release. `seq` as above.
+    KeyUp { code: KeyCode, seq: u64 },
     /// Best-effort UI hint. The safety epoch on [`SafetyState`] is the
     /// authoritative signal: if this event is dropped by a saturated queue,
     /// the safety worker still converges from the epoch latch.
@@ -116,13 +120,20 @@ fn start_windows_hook() -> Result<HookHandle, String> {
 
             if let Some(key) = identify_key(kb.vkCode, kb.scanCode, extended) {
                 if let Some(shared) = SHARED.get() {
-                    let result = shared.engine.lock().process_event(key, is_up);
+                    // Capture the engine's event sequence for this press
+                    // (P3) in the same lock scope as event processing: the
+                    // sequence read here IS this event's sequence. No new
+                    // blocking in the callback; the lock was already taken.
+                    let mut engine = shared.engine.lock();
+                    let result = engine.process_event(key, is_up);
+                    let seq = engine.event_sequence();
+                    drop(engine);
                     match result.ui {
                         Some((_, UiPulse::Down)) => {
-                            let _ = shared.tx.try_send(HookEvent::KeyDown { code: key });
+                            let _ = shared.tx.try_send(HookEvent::KeyDown { code: key, seq });
                         }
                         Some((_, UiPulse::Up)) => {
-                            let _ = shared.tx.try_send(HookEvent::KeyUp { code: key });
+                            let _ = shared.tx.try_send(HookEvent::KeyUp { code: key, seq });
                         }
                         None => {}
                     }

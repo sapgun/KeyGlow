@@ -12,7 +12,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "gen:layouts": "node scripts/generate-layouts.mjs",
-    "test": "node scripts/validate-layouts.mjs",
+    "test": "node scripts/validate-layouts.mjs && node scripts/test-store-contract.mjs",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "test:all": "npm test && npm run test:rust"
   },
