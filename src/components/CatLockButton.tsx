@@ -3,15 +3,16 @@ import { useT } from "../hooks/useT";
 interface CatLockButtonProps {
   locked: boolean;
   onToggle: () => void;
+  emergencyShortcut: string;
 }
 
-export function CatLockButton({ locked, onToggle }: CatLockButtonProps) {
+export function CatLockButton({ locked, onToggle, emergencyShortcut }: CatLockButtonProps) {
   const t = useT();
   return (
     <button
       type="button"
       onClick={onToggle}
-      title={locked ? t("catUnlockHint") : t("catLockHint")}
+      title={locked ? t("catUnlockHint", { shortcut: emergencyShortcut }) : t("catLockHint")}
       aria-pressed={locked}
       aria-label={t("catLock")}
       className={`cat-btn ${locked ? "active" : ""}`}

@@ -18,6 +18,7 @@ pub struct AppSnapshot {
     pub start_with_windows: bool,
     pub device_name: String,
     pub emergency_shortcut: String,
+    pub emergency_shortcut_config: crate::keyboard::shortcut::EmergencyShortcut,
     pub cat_lock: bool,
     pub locale: String,
     pub theme: String,
@@ -113,7 +114,8 @@ pub fn get_app_state(state: State<AppState>) -> AppSnapshot {
         onboarded: cfg.onboarded,
         start_with_windows: cfg.start_with_windows,
         device_name: "Generic Keyboard".into(),
-        emergency_shortcut: "Ctrl+Shift+F12".into(),
+        emergency_shortcut: cfg.emergency_shortcut.label(),
+        emergency_shortcut_config: cfg.emergency_shortcut,
         cat_lock: state.controller.is_cat_locked(),
         locale: cfg.locale,
         theme: cfg.theme,
@@ -131,6 +133,27 @@ pub fn get_app_state(state: State<AppState>) -> AppSnapshot {
 #[tauri::command]
 pub fn retry_persist(state: State<AppState>) -> Result<(), String> {
     state.retry_persist()
+}
+
+#[tauri::command]
+pub fn set_emergency_shortcut(
+    app: AppHandle,
+    state: State<AppState>,
+    shortcut: crate::keyboard::shortcut::EmergencyShortcut,
+) -> Result<AppSnapshot, String> {
+    // Validate before touching runtime state or the original settings file.
+    shortcut.compile()?;
+    // Serialize competing edits so the controller and config always agree.
+    let _shortcut_work = state.safety.convergence_lock();
+    state.controller.set_emergency_shortcut(&shortcut)?;
+    state.config.lock().emergency_shortcut = shortcut;
+    state.bump_runtime_revision();
+    let saved = state.persist();
+    // Other windows pull the authoritative stamped snapshot even on save failure.
+    let _ = app.emit("profile:changed", state.config.lock().clone());
+    saved?;
+    drop(_shortcut_work);
+    Ok(get_app_state(state))
 }
 
 #[tauri::command]

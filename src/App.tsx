@@ -6,6 +6,7 @@ import { ProfileSelector } from "./components/ProfileSelector";
 import { StatusBar } from "./components/StatusBar";
 import { TitleBar } from "./components/TitleBar";
 import { CatLockButton } from "./components/CatLockButton";
+import { EmergencyShortcutSettings } from "./components/EmergencyShortcutSettings";
 import { getLayout, layoutHint, layoutName, profileLabel } from "./lib/layouts";
 import * as api from "./lib/tauri";
 import { useAppStore } from "./stores/appStore";
@@ -176,7 +177,7 @@ export default function App() {
         {store.catLock && (
           <div className="mb-3 flex items-center justify-between rounded-xl border border-orange-400/40 bg-orange-500/15 px-4 py-3 text-sm">
             <span>{t("catBanner")}</span>
-            <span className="text-xs text-muted">{t("catBannerHint")}</span>
+            <span className="text-xs text-muted">{t("catBannerHint", { shortcut: store.emergencyShortcut })}</span>
           </div>
         )}
 
@@ -253,7 +254,8 @@ export default function App() {
             <Legend swatch="pressed" label={t("legendPressed")} />
           </div>
           <div className="flex items-center gap-2">
-            <CatLockButton locked={store.catLock} onToggle={() => void store.toggleCatLock()} />
+            <EmergencyShortcutSettings />
+            <CatLockButton locked={store.catLock} emergencyShortcut={store.emergencyShortcut} onToggle={() => void store.toggleCatLock()} />
             <label className="mr-3 flex items-center gap-2 text-xs text-muted">
               <input
                 type="checkbox"
@@ -283,6 +285,7 @@ export default function App() {
         layoutName={layoutName(layout.id, locale)}
         profileName={profile ? profileLabel(profile, locale) : t("profile.default")}
         disabledCount={store.disabledKeys.length}
+        emergencyShortcut={store.emergencyShortcut}
       />
     </div>
   );

@@ -11,6 +11,9 @@ pub struct WindowsController {
 }
 
 impl KeyboardController for WindowsController {
+    fn set_emergency_shortcut(&self, shortcut: &crate::keyboard::shortcut::EmergencyShortcut) -> Result<(), String> {
+        self.engine.lock().set_emergency_shortcut(shortcut)
+    }
     fn enable_key(&self, key: KeyCode) {
         self.engine.lock().enable_key(key);
     }

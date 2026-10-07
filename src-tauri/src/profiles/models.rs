@@ -2,7 +2,7 @@ use crate::keyboard::KeyCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
 pub const DEFAULT_LAYOUT: &str = "tkl-ansi";
 pub const DEFAULT_PROFILE_ID: &str = "default";
 
@@ -46,6 +46,8 @@ pub struct AppConfig {
     #[serde(default = "default_theme")]
     pub theme: String,
     #[serde(default)]
+    pub emergency_shortcut: crate::keyboard::shortcut::EmergencyShortcut,
+    #[serde(default)]
     pub profiles: Vec<Profile>,
     /// Runtime-only: the file was written by a newer KeyGlow. Never
     /// serialized back and never overwritten by `save` (see
@@ -80,6 +82,7 @@ impl Default for AppConfig {
             start_with_windows: false,
             locale: String::new(),
             theme: "dark".to_string(),
+            emergency_shortcut: Default::default(),
             profiles: builtin_profiles(),
             future_version: false,
             loaded_version: CONFIG_VERSION,
@@ -125,13 +128,13 @@ fn default_profile_entry() -> Profile {
 
 impl AppConfig {
     /// Load-time migration. Never destroys data:
-    /// - `version < CONFIG_VERSION`: sequential migrations (today v0/v1 are
-    ///   both covered by `normalize`; add a match arm per version later).
+    /// - `version < CONFIG_VERSION`: v0/v1 gain the default shortcut during
+    ///   serde loading and normalize to v2; existing profiles stay intact.
     /// - `version == CONFIG_VERSION`: validate + repair (`normalize`).
     /// - `version > CONFIG_VERSION`: non-destructive fallback. The config
     ///   is kept in memory read-only; `future_version` is set and
     ///   `AppState::persist` must refuse to overwrite the file, so a newer
-    ///   version's settings are never silently downgraded to v1.
+    ///   version's settings are never silently downgraded.
     pub fn migrate(mut self) -> Self {
         self.loaded_version = self.version;
         if self.version > CONFIG_VERSION {
@@ -143,7 +146,7 @@ impl AppConfig {
             return self;
         }
         // Sequential per-version migrations would go here (match on
-        // self.version). v0 and v1 both normalize to the current schema.
+        // self.version). v0/v1 default the new shortcut; v2 normalizes it.
         self.version = CONFIG_VERSION;
         self.normalize()
     }
@@ -151,6 +154,10 @@ impl AppConfig {
     /// Validate and repair a current-version config. Idempotent: running it
     /// twice changes nothing the second time.
     pub fn normalize(mut self) -> Self {
+        if self.emergency_shortcut.compile().is_err() {
+            tracing::warn!("invalid emergency shortcut; restoring Ctrl+Shift+F12");
+            self.emergency_shortcut = Default::default();
+        }
         if self.profiles.is_empty() {
             self.profiles = builtin_profiles();
         }
@@ -317,6 +324,22 @@ mod tests {
         assert!(!cfg.future_version);
         assert_eq!(cfg.version, CONFIG_VERSION);
         assert!(!cfg.profiles.is_empty());
+    }
+
+    #[test]
+    fn shortcut_migration_roundtrip_and_invalid_repair() {
+        let old: AppConfig = serde_json::from_str(r#"{"version":1,"locale":"ko","theme":"light"}"#).unwrap();
+        let mut config = old.migrate();
+        assert_eq!(config.version, 2);
+        assert_eq!(config.emergency_shortcut, Default::default());
+        assert_eq!(config.locale, "ko");
+        assert_eq!(config.theme, "light");
+        config.emergency_shortcut.key = "KeyU".into();
+        let saved = serde_json::to_string(&config).unwrap();
+        let loaded: AppConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded.migrate().emergency_shortcut.key, "KeyU");
+        config.emergency_shortcut.key = "Fn".into();
+        assert_eq!(config.normalize().emergency_shortcut, Default::default());
     }
 
     #[test]
