@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { AppSnapshot, EmergencyPayload, Profile } from "../types/keyboard";
+import type { AppSnapshot, EmergencyPayload, EmergencyShortcutConfig, Profile } from "../types/keyboard";
 import * as api from "../lib/tauri";
 import { detectLocale, parseLocale, type Locale } from "../i18n";
 import { applyTheme, parseTheme, readStoredTheme, type Theme } from "../lib/theme";
@@ -53,6 +53,9 @@ interface AppStore {
   onboarded: boolean;
   startWithWindows: boolean;
   deviceName: string;
+  emergencyShortcut: string;
+  emergencyShortcutConfig: EmergencyShortcutConfig;
+  setEmergencyShortcut: (shortcut: EmergencyShortcutConfig) => Promise<boolean>;
   emergencyNotice: boolean;
   error: string | null;
   eventError: string | null;
@@ -114,6 +117,8 @@ function apply(snapshot: AppSnapshot): Partial<AppStore> | null {
     onboarded: snapshot.onboarded,
     startWithWindows: snapshot.startWithWindows,
     deviceName: snapshot.deviceName,
+    emergencyShortcut: snapshot.emergencyShortcut,
+    emergencyShortcutConfig: snapshot.emergencyShortcutConfig ?? { ctrl: true, shift: true, alt: false, key: "F12" },
     catLock: Boolean(snapshot.catLock),
     locale: parseLocale(snapshot.locale) ?? detectLocale(),
     theme: parseTheme(snapshot.theme) ?? readStoredTheme(),
@@ -190,6 +195,22 @@ export const useAppStore = create<AppStore>((set, get) => {
   onboarded: false,
   startWithWindows: false,
   deviceName: "Generic Keyboard",
+  emergencyShortcut: "Ctrl + Shift + F12",
+  emergencyShortcutConfig: { ctrl: true, shift: true, alt: false, key: "F12" },
+  setEmergencyShortcut: async (shortcut) => {
+    const rev = beginCommand();
+    try {
+      const snapshot = await api.setEmergencyShortcut(shortcut);
+      if (!isCurrentCommand(rev)) return false;
+      const next = apply(snapshot);
+      if (!next) return false;
+      set(next);
+      return true;
+    } catch (err) {
+      if (isCurrentCommand(rev)) await fail(err);
+      return false;
+    }
+  },
   emergencyNotice: false,
   error: null,
   eventError: null,

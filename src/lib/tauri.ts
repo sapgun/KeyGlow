@@ -4,6 +4,7 @@ import type {
   AppSnapshot,
   CatLockPayload,
   EmergencyPayload,
+  EmergencyShortcutConfig,
   HookStatusPayload,
   PressedSnapshot,
   Profile,
@@ -30,6 +31,10 @@ export function enableAllKeys() {
 
 export function setCatLock(locked: boolean) {
   return invoke<CatLockPayload>("set_cat_lock", { locked });
+}
+
+export function setEmergencyShortcut(shortcut: EmergencyShortcutConfig) {
+  return invoke<AppSnapshot>("set_emergency_shortcut", { shortcut });
 }
 
 export function selectLayout(id: string) {

@@ -49,6 +49,13 @@ export interface PressedSnapshot {
   sequence: number;
 }
 
+export interface EmergencyShortcutConfig {
+  ctrl: boolean;
+  shift: boolean;
+  alt: boolean;
+  key: string;
+}
+
 export interface AppSnapshot {  hookActive: boolean;
   hookError: string | null;
   layoutId: string;
@@ -59,6 +66,7 @@ export interface AppSnapshot {  hookActive: boolean;
   startWithWindows: boolean;
   deviceName: string;
   emergencyShortcut: string;
+  emergencyShortcutConfig: EmergencyShortcutConfig;
   catLock: boolean;
   locale: string;
   theme: string;

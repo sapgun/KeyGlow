@@ -264,6 +264,23 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   check("T8 legacy boolean cat-lock ignored", cl === "unset");
 }
 
+// T9: configurable shortcut uses the native snapshot, preserves ordering,
+// and reports applied-but-unsaved runtime state truthfully.
+{
+  const store = await freshStore();
+  __resetInvoke();
+  const shortcut = { ctrl: true, shift: true, alt: false, key: "KeyU" };
+  __mockInvoke("set_emergency_shortcut", ({ shortcut: sent }) => {
+    check("T9 shortcut IPC sends chosen chord", eq(sent, shortcut));
+    return snap({ runtimeRevision: 10, emergencyShortcut: "Ctrl + Shift + U", emergencyShortcutConfig: shortcut });
+  });
+  check("T9 shortcut save succeeds", await store.getState().setEmergencyShortcut(shortcut));
+  check("T9 snapshot updates displayed and editable shortcut", store.getState().emergencyShortcut === "Ctrl + Shift + U" && eq(store.getState().emergencyShortcutConfig, shortcut));
+  __mockInvoke("set_emergency_shortcut", () => { throw new Error("disk full"); });
+  __mockInvoke("get_app_state", () => snap({ runtimeRevision: 11, emergencyShortcut: "Ctrl + Shift + U", emergencyShortcutConfig: shortcut, persisted: false, persistError: "disk full" }));
+  check("T9 failed persistence does not report successful save", !(await store.getState().setEmergencyShortcut(shortcut)));
+  check("T9 applied shortcut remains visible with unsaved state", !store.getState().persisted && store.getState().emergencyShortcutConfig.key === "KeyU" && store.getState().error.includes("disk full"));
+}
 console.log(`\n${passed} assertions passed`);
 // The store arms 8s stale-check timers (PRESS_STALE_CHECK_MS); they keep
 // the event loop alive long after the tests finish. Exit explicitly.

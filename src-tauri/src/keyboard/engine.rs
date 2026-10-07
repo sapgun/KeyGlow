@@ -1,4 +1,5 @@
 use super::keycodes::KeyCode;
+use super::shortcut::{EmergencyShortcut, ShortcutBinding};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyPhase {
@@ -39,6 +40,8 @@ pub struct FilterEngine {
     /// the native pressed snapshot changed while it was not watching
     /// (HF-04): a resync compares this sequence, not wall-clock time.
     event_seq: u64,
+    emergency_shortcut: ShortcutBinding,
+    emergency_down: bool,
 }
 
 impl Default for FilterEngine {
@@ -55,6 +58,8 @@ impl FilterEngine {
             physical_down: [false; KeyCode::COUNT],
             cat_lock: false,
             event_seq: 0,
+            emergency_shortcut: EmergencyShortcut::default().compile().unwrap(),
+            emergency_down: false,
         }
     }
 
@@ -117,13 +122,28 @@ impl FilterEngine {
         self.event_seq
     }
 
-    fn emergency_held(&self) -> bool {
+    fn shortcut_held(&self, shortcut: ShortcutBinding) -> bool {
         let ctrl = self.physical_down[KeyCode::ControlLeft.index()]
             || self.physical_down[KeyCode::ControlRight.index()];
         let shift = self.physical_down[KeyCode::ShiftLeft.index()]
             || self.physical_down[KeyCode::ShiftRight.index()];
-        let f12 = self.physical_down[KeyCode::F12.index()];
-        ctrl && shift && f12
+        let alt = self.physical_down[KeyCode::AltLeft.index()]
+            || self.physical_down[KeyCode::AltRight.index()];
+        (!shortcut.ctrl || ctrl) && (!shortcut.shift || shift) && (!shortcut.alt || alt)
+            && self.physical_down[shortcut.key.index()]
+    }
+
+    fn emergency_held(&self) -> bool {
+        self.shortcut_held(self.emergency_shortcut) || self.shortcut_held(ShortcutBinding {
+            ctrl: true, shift: true, alt: false, key: KeyCode::F12,
+        })
+    }
+
+    pub fn set_emergency_shortcut(&mut self, shortcut: &EmergencyShortcut) -> Result<(), String> {
+        self.emergency_shortcut = shortcut.compile()?;
+        // Require a new press rather than unlocking as a side effect of editing.
+        self.emergency_down = self.emergency_held();
+        Ok(())
     }
 
     pub fn process_event(&mut self, key: KeyCode, is_up: bool) -> EngineResult {
@@ -151,12 +171,14 @@ impl FilterEngine {
                     None
                 };
 
-                let emergency = if self.emergency_held() {
+                let held = self.emergency_held();
+                let emergency = if held && !self.emergency_down {
                     self.enable_all();
                     true
                 } else {
                     false
                 };
+                self.emergency_down = held;
 
                 if self.is_enabled(key) {
                     self.forwarded_down[i] = true;
@@ -178,6 +200,7 @@ impl FilterEngine {
                 let was_forwarded = self.forwarded_down[i];
                 self.physical_down[i] = false;
                 self.forwarded_down[i] = false;
+                self.emergency_down = self.emergency_held();
 
                 // If we never observed the matching down (hook started mid-hold,
                 // missed event, etc.) forward the up so Windows cannot stick a
@@ -199,6 +222,7 @@ impl FilterEngine {
 }
 
 pub trait KeyboardController: Send + Sync {
+    fn set_emergency_shortcut(&self, shortcut: &EmergencyShortcut) -> Result<(), String>;
     fn enable_key(&self, key: KeyCode);
     fn disable_key(&self, key: KeyCode);
     fn enable_all(&self);
@@ -381,5 +405,54 @@ mod tests {
         assert!(s2 > s1);
         up(&mut engine, KeyCode::KeyA);
         assert!(engine.event_sequence() > s2);
+    }
+
+    #[test]
+    fn custom_unlock_works_when_all_chord_keys_are_blocked() {
+        let mut engine = FilterEngine::new();
+        engine.set_emergency_shortcut(&EmergencyShortcut { key: "KeyU".into(), ..Default::default() }).unwrap();
+        engine.disable_key(KeyCode::KeyU);
+        engine.disable_key(KeyCode::ControlRight);
+        engine.disable_key(KeyCode::ShiftRight);
+        engine.set_cat_lock(true);
+        assert!(!down(&mut engine, KeyCode::ControlRight).emergency);
+        assert!(!down(&mut engine, KeyCode::ShiftRight).emergency);
+        assert!(down(&mut engine, KeyCode::KeyU).emergency);
+        assert!(!engine.is_cat_locked());
+        assert!(engine.disabled_keys().is_empty());
+        assert!(!engine.process(KeyCode::KeyU, KeyPhase::Repeat).emergency);
+        up(&mut engine, KeyCode::KeyU);
+        engine.set_cat_lock(true);
+        assert!(down(&mut engine, KeyCode::KeyU).emergency);
+    }
+
+    #[test]
+    fn fallback_and_any_press_order_work_after_customization() {
+        for order in [
+            [KeyCode::ControlLeft, KeyCode::ShiftRight, KeyCode::F12],
+            [KeyCode::F12, KeyCode::ControlRight, KeyCode::ShiftLeft],
+            [KeyCode::ShiftLeft, KeyCode::F12, KeyCode::ControlLeft],
+        ] {
+            let mut engine = FilterEngine::new();
+            engine.set_emergency_shortcut(&EmergencyShortcut { key: "KeyU".into(), ..Default::default() }).unwrap();
+            engine.set_cat_lock(true);
+            assert!(!down(&mut engine, order[0]).emergency);
+            assert!(!down(&mut engine, order[1]).emergency);
+            assert!(down(&mut engine, order[2]).emergency);
+            assert!(!engine.is_cat_locked());
+        }
+    }
+
+    #[test]
+    fn invalid_edit_keeps_previous_binding_and_partial_chord_does_not_unlock() {
+        let mut engine = FilterEngine::new();
+        let custom = EmergencyShortcut { ctrl: true, shift: false, alt: true, key: "KeyU".into() };
+        engine.set_emergency_shortcut(&custom).unwrap();
+        assert!(engine.set_emergency_shortcut(&EmergencyShortcut { key: "Fn".into(), ..custom }).is_err());
+        engine.set_cat_lock(true);
+        down(&mut engine, KeyCode::ControlLeft);
+        assert!(!down(&mut engine, KeyCode::KeyU).emergency);
+        assert!(engine.is_cat_locked());
+        assert!(down(&mut engine, KeyCode::AltRight).emergency);
     }
 }

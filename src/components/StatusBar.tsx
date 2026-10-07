@@ -6,6 +6,7 @@ interface StatusBarProps {
   layoutName: string;
   profileName: string;
   disabledCount: number;
+  emergencyShortcut: string;
 }
 
 export function StatusBar({
@@ -14,6 +15,7 @@ export function StatusBar({
   layoutName,
   profileName,
   disabledCount,
+  emergencyShortcut,
 }: StatusBarProps) {
   const t = useT();
   return (
@@ -33,7 +35,7 @@ export function StatusBar({
         <span>{profileName}</span>
         <span>{t("keysDisabled", { n: disabledCount })}</span>
       </div>
-      <div>{t("emergencyUnlock")}</div>
+      <div>{t("emergencyUnlock", { shortcut: emergencyShortcut })}</div>
       {hookError && <div className="w-full text-danger">{hookError}</div>}
     </div>
   );

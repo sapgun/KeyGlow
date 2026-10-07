@@ -64,6 +64,9 @@ struct UnsupportedController {
 
 #[cfg(not(windows))]
 impl KeyboardController for UnsupportedController {
+    fn set_emergency_shortcut(&self, shortcut: &crate::keyboard::shortcut::EmergencyShortcut) -> Result<(), String> {
+        self.engine.lock().set_emergency_shortcut(shortcut)
+    }
     fn enable_key(&self, key: crate::keyboard::KeyCode) {
         self.engine.lock().enable_key(key);
     }

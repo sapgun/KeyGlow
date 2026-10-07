@@ -295,6 +295,7 @@ pub fn run() {
             reset_profile,
             retry_persist,
             get_pressed_snapshot,
+            set_emergency_shortcut,
         ])
         .setup(|app| {
             let path = match app.path().app_config_dir() {
@@ -307,6 +308,9 @@ pub fn run() {
 
             let config = crate::profiles::load(&path);
             let backend = start_input_backend();
+            if let Err(err) = backend.controller.set_emergency_shortcut(&config.emergency_shortcut) {
+                tracing::error!("configured emergency shortcut invalid ({err}); retaining default escape");
+            }
 
             let keys = config
                 .current_profile()
