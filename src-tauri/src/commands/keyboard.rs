@@ -43,7 +43,7 @@ pub struct AppSnapshot {
 /// an event only when (safety_epoch, runtime_revision) is not older than
 /// what it already shows, so a late or duplicate event can never overwrite
 /// newer state (e.g. post-emergency truth).
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct StateChangedPayload {
     pub keys: Vec<String>,
@@ -51,7 +51,7 @@ pub struct StateChangedPayload {
     pub runtime_revision: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct CatLockPayload {
     pub locked: bool,
@@ -63,7 +63,7 @@ pub struct CatLockPayload {
 /// converged epoch so the UI can floor its ordering stamp: anything older
 /// (a late hydrate, a stale command response) is discarded instead of
 /// overwriting the safe state.
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct EmergencyPayload {
     pub epoch: u64,
