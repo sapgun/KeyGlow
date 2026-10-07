@@ -205,7 +205,8 @@ Physical (not covered by automation — needs the rig):
 ## Test 17 — Fresh install (HF-08)
 
 1. On a clean Windows machine (state the OS: Win10 / Win11, build), run
-   the NSIS installer (`KeyGlow_0.1.1_x64-setup.exe`) as a normal user.
+   the NSIS installer matching the candidate's actual version (currently
+   `KeyGlow_0.1.0_x64-setup.exe`; 0.1.1 is a release draft only) as a normal user.
    Expected: per-user install completes, app starts, tray icon appears,
    keyboard filtering works in Notepad.
 2. Run the portable exe (`keyglow.exe`) from a folder without installing.
@@ -282,7 +283,8 @@ real `hook.rs` drives through its statics):
 Compile-verified on Linux against faithful `windows_sys` 0.59 stubs
 (`--cfg windows`): the queue-readiness `PeekMessageW`, the checked
 `PostThreadMessageW`, and the `catch_unwind` exit-report plumbing
-type-check; behavior on real Windows is covered by CI.
+type-check. Windows CI compiles the real glue and runs the pure lifecycle
+tests; real hook/message-loop timing still requires the physical tests below.
 
 Physical (needs the rig):
 
