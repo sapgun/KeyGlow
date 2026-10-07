@@ -4,6 +4,7 @@ import type {
   AppSnapshot,
   CatLockPayload,
   EmergencyPayload,
+  HookStatusPayload,
   PressedSnapshot,
   Profile,
   StateChangedPayload,
@@ -183,6 +184,30 @@ export function onProfileChanged(handler: () => void): Promise<UnlistenFn> {
 export function onCatLock(handler: (payload: CatLockPayload) => void): Promise<UnlistenFn> {
   return listen<unknown>("keyboard:cat-lock", (event) => {
     const payload = payloadCatLock(event.payload);
+    if (payload) handler(payload);
+  });
+}
+
+function payloadHookStatus(payload: unknown): HookStatusPayload | null {
+  if (payload && typeof payload === "object" && "hookActive" in payload) {
+    const p = payload as Partial<HookStatusPayload>;
+    if (
+      typeof p.hookActive === "boolean" &&
+      (typeof p.hookError === "string" || p.hookError === null)
+    ) {
+      return { hookActive: p.hookActive, hookError: p.hookError ?? null };
+    }
+  }
+  return null;
+}
+
+export function onHookStatusChanged(
+  handler: (payload: HookStatusPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<unknown>("hook:status-changed", (event) => {
+    const payload = payloadHookStatus(event.payload);
+    // The backend only emits this when the hook thread died on its own;
+    // a missing payload means a protocol mismatch and is dropped.
     if (payload) handler(payload);
   });
 }

@@ -85,6 +85,11 @@ export default function App() {
               payload.runtimeRevision,
             ),
         ),
+        // HF-07: the hook thread died on its own — flip the status bar and
+        // the unavailable banner without waiting for a snapshot poll.
+        api.onHookStatusChanged((payload) =>
+          useAppStore.getState().setHookStatus(payload.hookActive, payload.hookError),
+        ),
       ]);
       const fns: Array<() => void> = [];
       let failure: unknown = null;
