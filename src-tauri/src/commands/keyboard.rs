@@ -1,4 +1,5 @@
 use crate::keyboard::KeyCode;
+use crate::profiles::models::VALID_LAYOUT_IDS;
 use crate::state::AppState;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
@@ -19,11 +20,20 @@ pub struct AppSnapshot {
     pub cat_lock: bool,
     pub locale: String,
     pub theme: String,
+    /// Whether the on-disk settings match the in-memory config (HF-03).
+    pub persisted: bool,
+    /// Last persist failure message, if the on-disk config is stale.
+    pub persist_error: Option<String>,
+    /// Machine-readable kind of the failure ("io_error" | "newer_version").
+    pub persist_error_kind: Option<String>,
+    /// Increments after every successful persist.
+    pub config_revision: u64,
 }
 
 #[tauri::command]
 pub fn get_app_state(state: State<AppState>) -> AppSnapshot {
     let cfg = state.config.lock().clone();
+    let (persisted, persist_error, persist_error_kind, config_revision) = state.persist_state();
     AppSnapshot {
         hook_active: state.is_hook_active(),
         hook_error: state.hook_error(),
@@ -38,7 +48,17 @@ pub fn get_app_state(state: State<AppState>) -> AppSnapshot {
         cat_lock: state.controller.is_cat_locked(),
         locale: cfg.locale,
         theme: cfg.theme,
+        persisted,
+        persist_error,
+        persist_error_kind,
+        config_revision,
     }
+}
+
+/// Best-effort re-save after a persist failure (UI "Retry" action, HF-03).
+#[tauri::command]
+pub fn retry_persist(state: State<AppState>) -> Result<(), String> {
+    state.retry_persist()
 }
 
 #[tauri::command]
@@ -127,14 +147,7 @@ pub fn set_cat_lock(app: AppHandle, state: State<AppState>, locked: bool) -> Res
 
 #[tauri::command]
 pub fn select_layout(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
-    let valid = [
-        "fullsize-ansi",
-        "tkl-ansi",
-        "75-ansi",
-        "65-ansi",
-        "60-ansi",
-    ];
-    if !valid.contains(&id.as_str()) {
+    if !VALID_LAYOUT_IDS.contains(&id.as_str()) {
         return Err(format!("unknown layout: {id}"));
     }
     {

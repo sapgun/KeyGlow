@@ -130,6 +130,32 @@ export default function App() {
           </div>
         )}
 
+        {(store.error || (!store.persisted && store.persistError)) && (
+          <div className="mb-4 flex items-center justify-between gap-4 rounded-xl border border-danger/30 bg-danger/10 px-4 py-3 text-sm text-danger">
+            <span>
+              {store.persistErrorKind === "newer_version"
+                ? t("newerVersionSettings")
+                : store.error
+                  ? `${t("settingsSaveFailed")} ${store.error}`
+                  : `${t("settingsUnsaved")} ${store.persistError ?? ""}`}
+            </span>
+            <span className="flex flex-shrink-0 gap-2">
+              <button
+                className="h-8 rounded-lg border border-danger/40 px-3 text-xs hover:bg-danger/10"
+                onClick={() => void store.retryPersist()}
+              >
+                {t("retry")}
+              </button>
+              <button
+                className="h-8 rounded-lg border border-danger/40 px-3 text-xs hover:bg-danger/10"
+                onClick={() => void store.enableAll()}
+              >
+                {t("enableAll")}
+              </button>
+            </span>
+          </div>
+        )}
+
         <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-panel p-4">
           <div className="mb-2 flex flex-shrink-0 items-center justify-between gap-3 text-[11px] uppercase tracking-[0.14em] text-muted">
             <span>

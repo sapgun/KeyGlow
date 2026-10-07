@@ -3,8 +3,12 @@ use crate::keyboard::{KeyCode, SafetyState};
 use crate::profiles::{save, AppConfig, DEFAULT_PROFILE_ID};
 use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Stable machine-readable reason for the last persist failure, for the UI.
+pub const PERSIST_ERROR_NEWER_VERSION: &str = "newer_version";
+pub const PERSIST_ERROR_IO: &str = "io_error";
 
 pub struct AppState {
     pub controller: Arc<dyn KeyboardController>,
@@ -17,12 +21,61 @@ pub struct AppState {
     /// Also serializes mutating commands: a command that started before an
     /// emergency press observes a newer epoch and must discard its intent.
     pub safety: Arc<SafetyState>,
+    /// Serializes all settings writes: the config clone + save is one
+    /// critical section, so concurrent commands can never interleave their
+    /// writes. Lock order is always persist_lock -> config lock, never the
+    /// reverse (commands must not hold persist_lock across persist()).
+    pub(crate) persist_lock: Mutex<()>,
+    /// Incremented after every successful persist.
+    pub persisted_revision: AtomicU64,
+    /// Last persist failure, if the on-disk config is stale.
+    pub persist_error: Mutex<Option<String>>,
+    /// Machine-readable kind of the last failure (for translated UI).
+    pub persist_error_kind: Mutex<Option<String>>,
 }
 
 impl AppState {
     pub fn persist(&self) -> Result<(), String> {
+        // Single writer: concurrent commands serialize here instead of
+        // sharing a temp file or interleaving writes (HF-02).
+        let _w = self.persist_lock.lock();
+        if self.config.lock().future_version {
+            // Non-destructive fallback (HF-06): a newer version's settings
+            // are never silently downgraded to v1.
+            let err =
+                "settings were written by a newer KeyGlow version; refusing to overwrite"
+                    .to_string();
+            *self.persist_error.lock() = Some(err.clone());
+            *self.persist_error_kind.lock() = Some(PERSIST_ERROR_NEWER_VERSION.to_string());
+            return Err(err);
+        }
         let cfg = self.config.lock().clone();
-        save(&self.config_path, &cfg)
+        match save(&self.config_path, &cfg) {
+            Ok(()) => {
+                self.persisted_revision.fetch_add(1, Ordering::SeqCst);
+                *self.persist_error.lock() = None;
+                *self.persist_error_kind.lock() = None;
+                Ok(())
+            }
+            Err(err) => {
+                *self.persist_error.lock() = Some(err.clone());
+                *self.persist_error_kind.lock() = Some(PERSIST_ERROR_IO.to_string());
+                Err(err)
+            }
+        }
+    }
+
+    /// Best-effort re-save after a failure (UI "Retry" action).
+    pub fn retry_persist(&self) -> Result<(), String> {
+        self.persist()
+    }
+
+    /// (persisted, last error, error kind, revision) for the UI snapshot.
+    pub fn persist_state(&self) -> (bool, Option<String>, Option<String>, u64) {
+        let err = self.persist_error.lock().clone();
+        let kind = self.persist_error_kind.lock().clone();
+        let rev = self.persisted_revision.load(Ordering::SeqCst);
+        (err.is_none(), err, kind, rev)
     }
 
     pub fn apply_current_profile(&self) {
@@ -59,8 +112,13 @@ impl AppState {
         self.controller.enable_all();
         {
             let mut cfg = self.config.lock();
+            // Common activation policy (HF-06), best-effort: the unlock
+            // itself must never fail. Default selection also syncs
+            // selected_layout to Default's layout.
             if cfg.profile(DEFAULT_PROFILE_ID).is_some() {
-                cfg.selected_profile = DEFAULT_PROFILE_ID.to_string();
+                if let Err(err) = cfg.activate_profile(DEFAULT_PROFILE_ID) {
+                    tracing::error!("emergency unlock: activation failed ({err})");
+                }
             }
             if let Some(profile) = cfg.current_profile_mut() {
                 profile.disabled_keys.clear();
@@ -68,8 +126,8 @@ impl AppState {
         }
         if let Err(err) = self.persist() {
             // Best effort by design: physical keys stay enabled regardless of
-            // disk state. The error is logged, not swallowed, so a broken
-            // settings path is visible in diagnostics.
+            // disk state. The error is recorded (not swallowed) so the UI can
+            // show it with a retry action.
             tracing::error!(
                 "emergency unlock: settings persist failed ({err}); input remains enabled"
             );
@@ -136,6 +194,10 @@ mod tests {
             hook_error: Mutex::new(None),
             shutdown: Arc::new(|| {}),
             safety: Arc::new(SafetyState::new()),
+            persist_lock: Mutex::new(()),
+            persisted_revision: AtomicU64::new(0),
+            persist_error: Mutex::new(None),
+            persist_error_kind: Mutex::new(None),
         }
     }
 
@@ -170,6 +232,11 @@ mod tests {
         assert!(state.snapshot_disabled().is_empty());
         assert!(!state.controller.is_cat_locked());
         assert_eq!(state.config.lock().selected_profile, DEFAULT_PROFILE_ID);
+        // The failure is recorded for the UI instead of swallowed.
+        let (persisted, err, kind, _) = state.persist_state();
+        assert!(!persisted);
+        assert!(err.is_some());
+        assert_eq!(kind.as_deref(), Some(PERSIST_ERROR_IO));
     }
 
     /// A command that was in flight while an emergency press landed must not
@@ -225,5 +292,97 @@ mod tests {
         let state = test_state(dir.join("settings.json"));
         let entered = state.safety_epoch();
         assert_eq!(state.safety_epoch(), entered);
+    }
+
+    #[test]
+    fn successful_persist_clears_error_and_bumps_revision() {
+        let dir = unique_temp_path("rev");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(dir.join("settings.json"));
+        assert!(state.persist().is_ok());
+        assert!(state.persist().is_ok());
+        let (persisted, err, kind, rev) = state.persist_state();
+        assert!(persisted);
+        assert!(err.is_none());
+        assert!(kind.is_none());
+        assert_eq!(rev, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_persist_recovers_after_failure() {
+        // Fail first (unwritable path), then point at a writable dir and
+        // retry: the error clears and the revision advances.
+        let blocker = unique_temp_path("retry-blocker");
+        File::create(&blocker).unwrap();
+        let mut state = test_state(blocker.join("settings.json"));
+        assert!(state.persist().is_err());
+        assert!(!state.persist_state().0);
+
+        let dir = unique_temp_path("retry-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        state.config_path = dir.join("settings.json");
+        assert!(state.retry_persist().is_ok());
+        let (persisted, err, _, rev) = state.persist_state();
+        assert!(persisted);
+        assert!(err.is_none());
+        assert_eq!(rev, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn future_version_config_is_never_overwritten() {
+        let dir = unique_temp_path("future");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // Simulate a file written by a newer KeyGlow.
+        std::fs::write(&path, r#"{"version": 99, "selectedProfile": "default"}"#).unwrap();
+        let loaded = crate::profiles::load(&path);
+        assert!(loaded.future_version);
+
+        let mut state = test_state(path.clone());
+        state.config = Mutex::new(loaded);
+        let err = state.persist().expect_err("must refuse to overwrite newer version");
+        assert!(err.contains("newer KeyGlow version"));
+        let (persisted, _, kind, _) = state.persist_state();
+        assert!(!persisted);
+        assert_eq!(kind.as_deref(), Some(PERSIST_ERROR_NEWER_VERSION));
+        // The file still holds the newer version's data.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"version\": 99") || raw.contains("\"version\":99"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_persist_matches_latest_revision() {
+        // N threads persisting concurrently: the single writer serializes
+        // them, every write is a complete valid file, and the revision
+        // counter matches the number of successful writes.
+        use std::sync::Barrier;
+        let dir = unique_temp_path("conc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(test_state(dir.join("settings.json")));
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..25 {
+                    state.persist().unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let rev = state.persisted_revision.load(Ordering::SeqCst);
+        assert_eq!(rev, 200);
+        let raw = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed.version, crate::profiles::models::CONFIG_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
