@@ -71,7 +71,7 @@ export function EmergencyShortcutSettings() {
     <button className="h-9 rounded-lg border border-border bg-panel-2 px-3 text-sm hover:border-lime/30" onClick={show}>
       {t("shortcutSettings")}
     </button>
-    <dialog ref={dialog} onCancel={() => setOpen(false)} onClose={() => setOpen(false)}
+    <dialog ref={dialog} onCancel={event => { if (busy) event.preventDefault(); else setOpen(false); }} onClose={() => setOpen(false)}
       aria-labelledby="shortcut-title" className="m-auto w-[min(480px,90vw)] rounded-2xl border border-border bg-panel p-6 text-text backdrop:bg-black/60">
       <h2 id="shortcut-title" className="mb-3 text-lg font-medium">{t("shortcutSettings")}</h2>
       <p className="mb-4 text-sm text-muted">{t("shortcutHelp")}</p>
