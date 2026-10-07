@@ -3,20 +3,27 @@
 // fake IPC layer. Registered via node:module register() before any import
 // of the store.
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
+// Use pathToFileURL so the URL is canonical on every OS. A hand-built
+// `file://${dir}/...` string keeps native backslashes on Windows, which
+// creates a second module-cache entry: the test's direct import and the
+// store's redirected import would then see different mock instances and
+// registered invoke() handlers would silently miss.
+const mockCoreUrl = pathToFileURL(path.join(dir, "mock-tauri-core.mjs")).href;
+const mockEventUrl = pathToFileURL(path.join(dir, "mock-tauri-event.mjs")).href;
 
 export async function resolve(specifier, context, nextResolve) {
   if (specifier === "@tauri-apps/api/core") {
     return {
-      url: `file://${dir}/mock-tauri-core.mjs`,
+      url: mockCoreUrl,
       shortCircuit: true,
     };
   }
   if (specifier === "@tauri-apps/api/event") {
     return {
-      url: `file://${dir}/mock-tauri-event.mjs`,
+      url: mockEventUrl,
       shortCircuit: true,
     };
   }
