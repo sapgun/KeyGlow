@@ -442,10 +442,14 @@ mod tests {
         // revision even when the best-effort persist fails.
         // persisted_revision counts disk writes; runtime_revision counts
         // state mutations. They are different numbers on purpose.
-        let dir = unique_temp_path("rt_emg");
-        std::fs::create_dir_all(&dir).unwrap();
-        // Point at a path inside a missing directory: persist() fails.
-        let state = test_state(dir.join("no-such-dir").join("settings.json"));
+        //
+        // save() creates missing parent dirs, so a missing dir is NOT a
+        // failure. Use a blocker *file* as the parent: create_dir_all on
+        // a file path fails on every platform.
+        let blocker = unique_temp_path("rt_emg_blocker");
+        File::create(&blocker).unwrap();
+        let state = test_state(blocker.join("settings.json"));
+        // Sanity: this persist really does fail in this fixture.
         assert!(state.persist().is_err());
         assert_eq!(state.persisted_revision.load(Ordering::SeqCst), 0);
 
@@ -463,7 +467,7 @@ mod tests {
         );
         // Physical recovery happened regardless of the disk failure.
         assert!(state.snapshot_disabled().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]
