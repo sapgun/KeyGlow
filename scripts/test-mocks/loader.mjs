@@ -3,6 +3,8 @@
 // fake IPC layer. Registered via node:module register() before any import
 // of the store.
 import path from "node:path";
+import { readFile } from "node:fs/promises";
+import ts from "typescript";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
@@ -13,6 +15,23 @@ const dir = path.dirname(fileURLToPath(import.meta.url));
 // registered invoke() handlers would silently miss.
 const mockCoreUrl = pathToFileURL(path.join(dir, "mock-tauri-core.mjs")).href;
 const mockEventUrl = pathToFileURL(path.join(dir, "mock-tauri-event.mjs")).href;
+
+// Use the already-installed compiler rather than Node's version-dependent
+// type stripping, so tests run on every version declared in package.json.
+export async function load(url, context, nextLoad) {
+  if (url.startsWith("file:") && new URL(url).pathname.endsWith(".ts")) {
+    const source = await readFile(new URL(url), "utf8");
+    return {
+      format: "module",
+      source: ts.transpileModule(source, {
+        compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+        fileName: fileURLToPath(url),
+      }).outputText,
+      shortCircuit: true,
+    };
+  }
+  return nextLoad(url, context);
+}
 
 export async function resolve(specifier, context, nextResolve) {
   if (specifier === "@tauri-apps/api/core") {

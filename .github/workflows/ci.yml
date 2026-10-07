@@ -78,7 +78,7 @@ jobs:
       - name: Install dependencies (lockfile)
         run: npm ci
 
-      - name: Layout validation
+      - name: Layout and store contract validation
         run: npm test
 
       - name: Rust tests
@@ -86,6 +86,22 @@ jobs:
 
       - name: Frontend build
         run: npm run build
+
+  node-compatibility:
+    name: Frontend (Node ${{ matrix.node }})
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        node: ["20.19.0", "22.12.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
 
   installer:
     name: Build installer (Windows)
@@ -134,7 +150,7 @@ jobs:
 
   release-gate:
     name: Release gate
-    needs: [version-check, build, installer]
+    needs: [version-check, build, node-compatibility, installer]
     runs-on: ubuntu-latest
     steps:
       - name: Manual gates before any public release

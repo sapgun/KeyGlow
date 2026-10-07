@@ -5,7 +5,7 @@
 // actions, the actual IPC payload parsing, and the actual ordering gates,
 // with native timing simulated (deferred promises, late/duplicate events).
 //
-// Run: node scripts/test-store-contract.mjs   (node >= 22, type stripping)
+// Run: node scripts/test-store-contract.mjs (supported Node; compiler-backed loader)
 // CI: wired into `npm test`.
 import { register } from "node:module";
 
