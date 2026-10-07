@@ -30,7 +30,7 @@ fn emit_key(app: &tauri::AppHandle, event: &str, code: &str, seq: u64) {
     // can order key events against pressed-snapshot responses. Without it,
     // a snapshot taken before a key-down but applied after would drop the
     // physically held key from the display.
-    #[derive(serde::Serialize)]
+    #[derive(serde::Serialize, Clone, Debug)]
     struct KeyPressPayload<'a> {
         code: &'a str,
         seq: u64,
@@ -297,6 +297,7 @@ pub fn run() {
                 persisted_revision: AtomicU64::new(0),
                 persist_error: parking_lot::Mutex::new(None),
                 persist_error_kind: parking_lot::Mutex::new(None),
+                runtime_revision: AtomicU64::new(0),
             });
 
             spawn_event_pump(app.handle().clone(), backend.events);
