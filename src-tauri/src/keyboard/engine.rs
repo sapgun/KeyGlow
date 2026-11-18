@@ -24,6 +24,24 @@ pub struct EngineResult {
     pub decision: HookDecision,
     pub emergency: bool,
     pub ui: Option<(KeyCode, UiPulse)>,
+    /// S8: keys the caller must inject with `SendInput`, in order.
+    /// Pure data — the engine never calls Win32 itself. Normally at most
+    /// one action (a remap down/up); an emergency flush may carry several
+    /// ups (one per held target). Empty when nothing is injected.
+    pub inject: Vec<InjectAction>,
+    /// S8: the source whose first down was remapped by this event, if
+    /// any. The caller needs it for the fail-open path: if executing
+    /// `inject` fails, it rolls the optimistic held state back with
+    /// `cancel_held_remap` and forwards the physical key instead.
+    pub remapped_source: Option<KeyCode>,
+}
+
+/// S8: one key event to inject (ADR §2, D3/D4). Scan-code injection;
+/// the executor translates this with `to_vk_scan`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InjectAction {
+    Down(KeyCode),
+    Up(KeyCode),
 }
 
 /// In-memory filter used by the Windows hook callback.
@@ -39,6 +57,16 @@ pub struct FilterEngine {
     /// the native pressed snapshot changed while it was not watching
     /// (HF-04): a resync compares this sequence, not wall-clock time.
     event_seq: u64,
+    /// S8: per-profile remap rules, source -> target. Installed by
+    /// `set_remap_rules` (flush first, then install); a held key always
+    /// releases what its down injected, never the current rules (D6).
+    remap_rules: [Option<KeyCode>; KeyCode::COUNT],
+    /// S8: for each source currently physically held, the target that
+    /// was injected for it — a snapshot of the mapping at down time.
+    remap_held: [Option<KeyCode>; KeyCode::COUNT],
+    /// S8: how many held sources currently map to each target. A target
+    /// up is injected only when its refcount reaches 0 (shared targets).
+    target_refcount: [u32; KeyCode::COUNT],
 }
 
 impl Default for FilterEngine {
@@ -55,6 +83,9 @@ impl FilterEngine {
             physical_down: [false; KeyCode::COUNT],
             cat_lock: false,
             event_seq: 0,
+            remap_rules: [None; KeyCode::COUNT],
+            remap_held: [None; KeyCode::COUNT],
+            target_refcount: [0; KeyCode::COUNT],
         }
     }
 
@@ -66,9 +97,70 @@ impl FilterEngine {
         self.disabled[key.index()] = true;
     }
 
-    pub fn enable_all(&mut self) {
+    /// Emergency recovery: clear Cat Lock and the disabled set, and
+    /// release every held remap target (S8 §5/§6). Returns the flush
+    /// actions for the caller to execute — the engine never injects
+    /// itself. Idempotent via `flush_remaps`.
+    pub fn enable_all(&mut self) -> Vec<InjectAction> {
+        let flushed = self.flush_remaps();
         self.cat_lock = false;
         self.disabled = [false; KeyCode::COUNT];
+        flushed
+    }
+
+    /// S8: install a new rule set. Flushes held remaps first (their ups
+    /// are returned for the caller to execute), then installs the rules.
+    /// The new rules apply to the *next* press only, never retroactively
+    /// to a held key (D6). A self-map is ignored defensively; real
+    /// validation lives in the command layer (V1–V5).
+    pub fn set_remap_rules(&mut self, rules: &[(KeyCode, KeyCode)]) -> Vec<InjectAction> {
+        let flushed = self.flush_remaps();
+        self.remap_rules = [None; KeyCode::COUNT];
+        for &(from, to) in rules {
+            if from != to {
+                self.remap_rules[from.index()] = Some(to);
+            }
+        }
+        flushed
+    }
+
+    /// S8: current rule set, for tests and diagnostics.
+    pub fn remap_rules(&self) -> Vec<(KeyCode, KeyCode)> {
+        KeyCode::ALL
+            .iter()
+            .copied()
+            .filter_map(|from| self.remap_rules[from.index()].map(|to| (from, to)))
+            .collect()
+    }
+
+    /// S8: release every held remap target. For each held source, the
+    /// refcount drops and a target up is injected only when its refcount
+    /// reaches 0. Idempotent: a second flush injects nothing.
+    pub fn flush_remaps(&mut self) -> Vec<InjectAction> {
+        let mut actions = Vec::new();
+        for source in KeyCode::ALL {
+            if let Some(target) = self.remap_held[source.index()].take() {
+                let t = target.index();
+                self.target_refcount[t] = self.target_refcount[t].saturating_sub(1);
+                if self.target_refcount[t] == 0 {
+                    actions.push(InjectAction::Up(target));
+                }
+            }
+        }
+        actions
+    }
+
+    /// S8 fail-open rollback (ADR §2, D3): the caller tried to execute
+    /// the remap down for `source` and `SendInput` failed, so the
+    /// physical key is forwarded instead. Undo the optimistic held
+    /// state recorded by `process` and mark the source as forwarded so
+    /// its matching up forwards too.
+    pub fn cancel_held_remap(&mut self, source: KeyCode) {
+        if let Some(target) = self.remap_held[source.index()].take() {
+            let t = target.index();
+            self.target_refcount[t] = self.target_refcount[t].saturating_sub(1);
+        }
+        self.forwarded_down[source.index()] = true;
     }
 
     pub fn set_cat_lock(&mut self, locked: bool) {
@@ -127,6 +219,26 @@ impl FilterEngine {
     }
 
     pub fn process_event(&mut self, key: KeyCode, is_up: bool) -> EngineResult {
+        self.process_event_injected(key, is_up, false)
+    }
+
+    /// S8 (ADR §1): `injected` is true when the hook event carries
+    /// `LLKHF_INJECTED` / `LLKHF_LOWER_IL_INJECTED`. Injected events take
+    /// a separate lane: they never remap, never set `physical_down`,
+    /// never glow, never count toward the emergency chord — but they
+    /// still respect disable / Cat Lock, so v0.1 behaviour (an on-screen
+    /// keyboard sending a disabled key is blocked) is preserved. No
+    /// per-key injected state is kept: a stray injected up for a key
+    /// that is not down is harmless to forward.
+    pub fn process_event_injected(
+        &mut self,
+        key: KeyCode,
+        is_up: bool,
+        injected: bool,
+    ) -> EngineResult {
+        if injected {
+            return self.process_injected(key, is_up);
+        }
         let i = key.index();
         let phase = if is_up {
             KeyPhase::Up
@@ -136,6 +248,23 @@ impl FilterEngine {
             KeyPhase::Down
         };
         self.process(key, phase)
+    }
+
+    fn process_injected(&mut self, key: KeyCode, _is_up: bool) -> EngineResult {
+        // Deliberately no event_seq bump and no physical_down mutation:
+        // injected events are invisible to the UI ordering machinery.
+        let decision = if self.is_enabled(key) {
+            HookDecision::Forward
+        } else {
+            HookDecision::Consume
+        };
+        EngineResult {
+            decision,
+            emergency: false,
+            ui: None,
+            inject: vec![],
+            remapped_source: None,
+        }
     }
 
     pub fn process(&mut self, key: KeyCode, phase: KeyPhase) -> EngineResult {
@@ -151,25 +280,80 @@ impl FilterEngine {
                     None
                 };
 
-                let emergency = if self.emergency_held() {
-                    self.enable_all();
-                    true
-                } else {
-                    false
-                };
+                // S8 (D7): emergency is evaluated from physical state
+                // only, before any remap decision, and it always wins.
+                // The chord-completing key itself is forwarded (no remap
+                // lookup on this event); the flush releases held targets.
+                if self.emergency_held() {
+                    let inject = self.enable_all();
+                    return EngineResult {
+                        decision: HookDecision::Forward,
+                        emergency: true,
+                        ui,
+                        inject,
+                        remapped_source: None,
+                    };
+                }
+
+                // S8 remap (physical first down only, D5): snapshot the
+                // mapping at down time and consume the source. The target
+                // down is injected only when its refcount transitions
+                // 0 -> 1 — mirroring the up rule (up injected only at
+                // 1 -> 0): a second holder of an already-down target
+                // injects nothing, so downs and ups stay paired. A
+                // disabled or Cat Locked source falls through to the
+                // normal consume path below.
+                if let Some(target) = self.remap_rules[i] {
+                    if first {
+                        if self.is_enabled(key) {
+                            let t = target.index();
+                            let inject = if self.target_refcount[t] == 0 {
+                                vec![InjectAction::Down(target)]
+                            } else {
+                                vec![]
+                            };
+                            self.remap_held[i] = Some(target);
+                            self.target_refcount[t] += 1;
+                            return EngineResult {
+                                decision: HookDecision::Consume,
+                                emergency: false,
+                                ui,
+                                inject,
+                                remapped_source: Some(key),
+                            };
+                        }
+                    } else {
+                        // Repeat of a remapped source: consume, inject
+                        // nothing. This also covers a rule flushed
+                        // mid-hold: the repeat must not inject the new
+                        // target — new rules apply to the next press
+                        // only (D6).
+                        return EngineResult {
+                            decision: HookDecision::Consume,
+                            emergency: false,
+                            ui: None,
+                            inject: vec![],
+                            remapped_source: None,
+                        };
+                    }
+                }
 
                 if self.is_enabled(key) {
                     self.forwarded_down[i] = true;
                     EngineResult {
                         decision: HookDecision::Forward,
-                        emergency,
+                        emergency: false,
                         ui,
+                        inject: vec![],
+                        remapped_source: None,
                     }
                 } else {
                     EngineResult {
                         decision: HookDecision::Consume,
-                        emergency,
+                        emergency: false,
                         ui,
+                        inject: vec![],
+                        remapped_source: None,
                     }
                 }
             }
@@ -178,6 +362,29 @@ impl FilterEngine {
                 let was_forwarded = self.forwarded_down[i];
                 self.physical_down[i] = false;
                 self.forwarded_down[i] = false;
+
+                // S8 (D6): a held key always releases what its down
+                // injected — the down-time snapshot, never the current
+                // rules. The source up is consumed (the OS never saw
+                // the source down); the injected target up is what the
+                // OS receives. Shared targets release only when the
+                // last holder lets go.
+                if let Some(target) = self.remap_held[i].take() {
+                    let t = target.index();
+                    self.target_refcount[t] = self.target_refcount[t].saturating_sub(1);
+                    let inject = if self.target_refcount[t] == 0 {
+                        vec![InjectAction::Up(target)]
+                    } else {
+                        vec![]
+                    };
+                    return EngineResult {
+                        decision: HookDecision::Consume,
+                        emergency: false,
+                        ui: Some((key, UiPulse::Up)),
+                        inject,
+                        remapped_source: None,
+                    };
+                }
 
                 // If we never observed the matching down (hook started mid-hold,
                 // missed event, etc.) forward the up so Windows cannot stick a
@@ -192,6 +399,8 @@ impl FilterEngine {
                     decision,
                     emergency: false,
                     ui: Some((key, UiPulse::Up)),
+                    inject: vec![],
+                    remapped_source: None,
                 }
             }
         }
@@ -201,7 +410,9 @@ impl FilterEngine {
 pub trait KeyboardController: Send + Sync {
     fn enable_key(&self, key: KeyCode);
     fn disable_key(&self, key: KeyCode);
-    fn enable_all(&self);
+    /// Emergency recovery; returns the remap flush actions (S8) for the
+    /// caller to execute via `SendInput`. Empty when nothing was held.
+    fn enable_all(&self) -> Vec<InjectAction>;
     fn is_enabled(&self, key: KeyCode) -> bool;
     fn set_disabled_keys(&self, keys: &[KeyCode]);
     fn disabled_keys(&self) -> Vec<KeyCode>;
@@ -211,6 +422,12 @@ pub trait KeyboardController: Send + Sync {
     fn pressed_keys(&self) -> Vec<KeyCode>;
     /// Sequence of the last processed hook event (HF-04).
     fn event_sequence(&self) -> u64;
+    /// S8: install a profile's remap rules (flush first, then install).
+    /// Returns the flush actions for the caller to execute.
+    fn set_remap_rules(&self, rules: &[(KeyCode, KeyCode)]) -> Vec<InjectAction>;
+    /// S8: release every held remap target; returns the ups to inject.
+    /// Idempotent.
+    fn flush_remaps(&self) -> Vec<InjectAction>;
 }
 
 #[cfg(test)]
@@ -381,5 +598,245 @@ mod tests {
         assert!(s2 > s1);
         up(&mut engine, KeyCode::KeyA);
         assert!(engine.event_sequence() > s2);
+    }
+
+    // ---- S8: key remapping (ADR-REMAPPING.md §10) ----
+
+    fn remap_engine(rules: &[(KeyCode, KeyCode)]) -> FilterEngine {
+        let mut engine = FilterEngine::new();
+        assert!(engine.set_remap_rules(rules).is_empty());
+        engine
+    }
+
+    #[test]
+    fn remap_down_injects_target_once_repeat_nothing_up_injects_up() {
+        let mut engine = remap_engine(&[(KeyCode::KeyA, KeyCode::KeyB)]);
+        let result = down(&mut engine, KeyCode::KeyA);
+        assert_eq!(result.decision, HookDecision::Consume);
+        assert_eq!(result.inject, vec![InjectAction::Down(KeyCode::KeyB)]);
+        assert_eq!(result.remapped_source, Some(KeyCode::KeyA));
+        assert_eq!(result.ui, Some((KeyCode::KeyA, UiPulse::Down)));
+        // The physical source still glows; the injected target never does.
+        let repeat = engine.process(KeyCode::KeyA, KeyPhase::Repeat);
+        assert_eq!(repeat.decision, HookDecision::Consume);
+        assert!(repeat.inject.is_empty());
+        assert_eq!(repeat.ui, None);
+        let release = up(&mut engine, KeyCode::KeyA);
+        assert_eq!(release.decision, HookDecision::Consume);
+        assert_eq!(release.inject, vec![InjectAction::Up(KeyCode::KeyB)]);
+        assert_eq!(release.ui, Some((KeyCode::KeyA, UiPulse::Up)));
+        // The unmapped key itself is untouched.
+        let plain = down(&mut engine, KeyCode::KeyB);
+        assert_eq!(plain.decision, HookDecision::Forward);
+        assert!(plain.inject.is_empty());
+    }
+
+    #[test]
+    fn source_up_after_rule_change_releases_down_time_target() {
+        let mut engine = remap_engine(&[(KeyCode::KeyA, KeyCode::KeyB)]);
+        down(&mut engine, KeyCode::KeyA);
+        // Change the rule mid-hold: flush releases B, never injects C.
+        let flushed = engine.set_remap_rules(&[(KeyCode::KeyA, KeyCode::KeyC)]);
+        assert_eq!(flushed, vec![InjectAction::Up(KeyCode::KeyB)]);
+        // The held key's release injects nothing (already flushed) and
+        // never the new target.
+        let release = up(&mut engine, KeyCode::KeyA);
+        assert!(release.inject.is_empty());
+        assert_eq!(release.decision, HookDecision::Consume);
+        // The next press uses the new rule.
+        let again = down(&mut engine, KeyCode::KeyA);
+        assert_eq!(again.inject, vec![InjectAction::Down(KeyCode::KeyC)]);
+        let _ = up(&mut engine, KeyCode::KeyA);
+    }
+
+    #[test]
+    fn shared_target_refcount_releases_on_last_holder() {
+        let mut engine = remap_engine(&[
+            (KeyCode::KeyA, KeyCode::KeyB),
+            (KeyCode::KeyC, KeyCode::KeyB),
+        ]);
+        down(&mut engine, KeyCode::KeyA);
+        let second = down(&mut engine, KeyCode::KeyC);
+        // C's down injects nothing: B is already down (refcount 2).
+        assert!(second.inject.is_empty());
+        assert_eq!(second.decision, HookDecision::Consume);
+        let first_release = up(&mut engine, KeyCode::KeyA);
+        assert!(first_release.inject.is_empty(), "B stays down for C");
+        let last_release = up(&mut engine, KeyCode::KeyC);
+        assert_eq!(last_release.inject, vec![InjectAction::Up(KeyCode::KeyB)]);
+    }
+
+    #[test]
+    fn flush_on_rule_change_is_idempotent() {
+        let mut engine = remap_engine(&[(KeyCode::KeyA, KeyCode::KeyB)]);
+        down(&mut engine, KeyCode::KeyA);
+        let first = engine.set_remap_rules(&[]);
+        assert_eq!(first, vec![InjectAction::Up(KeyCode::KeyB)]);
+        assert!(engine.flush_remaps().is_empty());
+        assert!(engine.set_remap_rules(&[]).is_empty());
+        // Rules are gone: the next press forwards the source.
+        let again = down(&mut engine, KeyCode::KeyA);
+        assert_eq!(again.decision, HookDecision::Forward);
+        assert!(again.inject.is_empty());
+        let _ = up(&mut engine, KeyCode::KeyA);
+    }
+
+    #[test]
+    fn emergency_flushes_held_remaps_and_keeps_rules() {
+        let mut engine = remap_engine(&[(KeyCode::KeyA, KeyCode::KeyB)]);
+        engine.disable_key(KeyCode::KeyC);
+        down(&mut engine, KeyCode::KeyA);
+        // Emergency chord from physical keys.
+        down(&mut engine, KeyCode::ControlLeft);
+        down(&mut engine, KeyCode::ShiftLeft);
+        let result = down(&mut engine, KeyCode::F12);
+        assert!(result.emergency);
+        // The flush released B; F12 itself forwarded, not remapped.
+        assert_eq!(result.inject, vec![InjectAction::Up(KeyCode::KeyB)]);
+        assert_eq!(result.decision, HookDecision::Forward);
+        assert!(engine.is_enabled(KeyCode::KeyC));
+        // Rules survive the emergency (config, not runtime disable state).
+        assert_eq!(
+            engine.remap_rules(),
+            vec![(KeyCode::KeyA, KeyCode::KeyB)]
+        );
+        // The still-held A's release injects nothing (already flushed).
+        let release = up(&mut engine, KeyCode::KeyA);
+        assert!(release.inject.is_empty());
+        // Release the chord first: while Ctrl+Shift+F12 are still held, any
+        // further down is another emergency press (pre-existing semantics).
+        let _ = up(&mut engine, KeyCode::F12);
+        let _ = up(&mut engine, KeyCode::ShiftLeft);
+        let _ = up(&mut engine, KeyCode::ControlLeft);
+        // The next press remaps normally again.
+        let again = down(&mut engine, KeyCode::KeyA);
+        assert_eq!(again.inject, vec![InjectAction::Down(KeyCode::KeyB)]);
+        let _ = up(&mut engine, KeyCode::KeyA);
+    }
+
+    #[test]
+    fn injected_events_never_remap_or_touch_physical_state() {
+        let mut engine = remap_engine(&[(KeyCode::KeyA, KeyCode::KeyB)]);
+        let injected_down = engine.process_event_injected(KeyCode::KeyA, false, true);
+        assert_eq!(injected_down.decision, HookDecision::Forward);
+        assert!(injected_down.inject.is_empty());
+        assert_eq!(injected_down.ui, None);
+        assert!(!injected_down.emergency);
+        assert!(engine.pressed_keys().is_empty());
+        let injected_up = engine.process_event_injected(KeyCode::KeyA, true, true);
+        assert_eq!(injected_up.decision, HookDecision::Forward);
+        assert!(injected_up.inject.is_empty());
+        // Injected chord keys never count toward the emergency chord:
+        // the physical F12 below must not fire it.
+        engine.process_event_injected(KeyCode::ControlLeft, false, true);
+        engine.process_event_injected(KeyCode::ShiftLeft, false, true);
+        let f12 = down(&mut engine, KeyCode::F12);
+        assert!(!f12.emergency);
+        // ...but the physical chord still fires on its own.
+        down(&mut engine, KeyCode::ControlLeft);
+        down(&mut engine, KeyCode::ShiftLeft);
+        // F12 is already down from the line above, so this is a repeat:
+        // use a fresh engine for the clean chord.
+        let mut engine2 = remap_engine(&[(KeyCode::KeyA, KeyCode::KeyB)]);
+        down(&mut engine2, KeyCode::ControlLeft);
+        down(&mut engine2, KeyCode::ShiftLeft);
+        let chord = down(&mut engine2, KeyCode::F12);
+        assert!(chord.emergency);
+    }
+
+    #[test]
+    fn injected_events_still_respect_disable_and_cat_lock() {
+        let mut engine = remap_engine(&[(KeyCode::KeyA, KeyCode::KeyB)]);
+        engine.disable_key(KeyCode::KeyA);
+        let blocked = engine.process_event_injected(KeyCode::KeyA, false, true);
+        assert_eq!(blocked.decision, HookDecision::Consume);
+        assert!(blocked.inject.is_empty());
+        engine.enable_key(KeyCode::KeyA);
+        engine.set_cat_lock(true);
+        let locked = engine.process_event_injected(KeyCode::KeyA, false, true);
+        assert_eq!(locked.decision, HookDecision::Consume);
+        // An injected up for a disabled key is consumed too (same
+        // enabled-check as a physical down, §1.4).
+        let locked_up = engine.process_event_injected(KeyCode::KeyA, true, true);
+        assert_eq!(locked_up.decision, HookDecision::Consume);
+    }
+
+    #[test]
+    fn cat_lock_suppresses_remap_and_releasing_it_restores_remap() {
+        let mut engine = remap_engine(&[(KeyCode::KeyA, KeyCode::KeyB)]);
+        engine.set_cat_lock(true);
+        let locked = down(&mut engine, KeyCode::KeyA);
+        assert_eq!(locked.decision, HookDecision::Consume);
+        assert!(locked.inject.is_empty());
+        let locked_up = up(&mut engine, KeyCode::KeyA);
+        assert!(locked_up.inject.is_empty());
+        engine.set_cat_lock(false);
+        let free = down(&mut engine, KeyCode::KeyA);
+        assert_eq!(free.inject, vec![InjectAction::Down(KeyCode::KeyB)]);
+        let _ = up(&mut engine, KeyCode::KeyA);
+    }
+
+    #[test]
+    fn remapped_modifier_alone_injects_clean_pair() {
+        let mut engine = remap_engine(&[(KeyCode::ShiftLeft, KeyCode::ControlLeft)]);
+        let result = down(&mut engine, KeyCode::ShiftLeft);
+        assert_eq!(
+            result.inject,
+            vec![InjectAction::Down(KeyCode::ControlLeft)]
+        );
+        assert_eq!(result.decision, HookDecision::Consume);
+        let release = up(&mut engine, KeyCode::ShiftLeft);
+        assert_eq!(
+            release.inject,
+            vec![InjectAction::Up(KeyCode::ControlLeft)]
+        );
+        // No stuck state: a plain key afterwards forwards normally.
+        assert_eq!(down(&mut engine, KeyCode::KeyC).decision, HookDecision::Forward);
+    }
+
+    #[test]
+    fn fail_open_rollback_cancels_held_remap_and_forwards_up() {
+        let mut engine = remap_engine(&[(KeyCode::KeyA, KeyCode::KeyB)]);
+        let result = down(&mut engine, KeyCode::KeyA);
+        assert_eq!(result.remapped_source, Some(KeyCode::KeyA));
+        // Simulate the hook callback's SendInput failure: roll back.
+        engine.cancel_held_remap(KeyCode::KeyA);
+        assert!(engine.flush_remaps().is_empty(), "nothing left to flush");
+        // The matching up now forwards (the down was forwarded).
+        let release = up(&mut engine, KeyCode::KeyA);
+        assert_eq!(release.decision, HookDecision::Forward);
+        assert!(release.inject.is_empty());
+        // And the next press remaps normally again.
+        let again = down(&mut engine, KeyCode::KeyA);
+        assert_eq!(again.inject, vec![InjectAction::Down(KeyCode::KeyB)]);
+        let _ = up(&mut engine, KeyCode::KeyA);
+    }
+
+    #[test]
+    fn enable_all_returns_flush_and_clears_disabled() {
+        let mut engine = remap_engine(&[(KeyCode::KeyA, KeyCode::KeyB)]);
+        engine.disable_key(KeyCode::KeyC);
+        down(&mut engine, KeyCode::KeyA);
+        let flushed = engine.enable_all();
+        assert_eq!(flushed, vec![InjectAction::Up(KeyCode::KeyB)]);
+        assert!(engine.is_enabled(KeyCode::KeyC));
+        assert!(engine.flush_remaps().is_empty());
+        // Rules survive enable_all (they are config).
+        assert_eq!(
+            engine.remap_rules(),
+            vec![(KeyCode::KeyA, KeyCode::KeyB)]
+        );
+    }
+
+    #[test]
+    fn remap_source_disabled_at_down_is_consumed_without_inject() {
+        let mut engine = remap_engine(&[(KeyCode::KeyA, KeyCode::KeyB)]);
+        engine.disable_key(KeyCode::KeyA);
+        let result = down(&mut engine, KeyCode::KeyA);
+        assert_eq!(result.decision, HookDecision::Consume);
+        assert!(result.inject.is_empty());
+        let release = up(&mut engine, KeyCode::KeyA);
+        assert_eq!(release.decision, HookDecision::Consume);
+        assert!(release.inject.is_empty());
     }
 }

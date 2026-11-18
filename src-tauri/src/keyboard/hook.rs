@@ -155,8 +155,9 @@ fn start_windows_hook() -> Result<HookStart, String> {
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, SetWindowsHookExW,
-        TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG,
-        PM_NOREMOVE, WH_KEYBOARD_LL, WM_KEYUP, WM_SYSKEYUP,
+        TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
+        LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, LLKHF_UP, MSG, PM_NOREMOVE,
+        WH_KEYBOARD_LL, WM_KEYUP, WM_SYSKEYUP,
     };
 
     unsafe extern "system" fn low_level_keyboard_proc(
@@ -170,6 +171,11 @@ fn start_windows_hook() -> Result<HookStart, String> {
             let is_up =
                 (flags & LLKHF_UP) != 0 || w_param as u32 == WM_KEYUP || w_param as u32 == WM_SYSKEYUP;
             let extended = (flags & LLKHF_EXTENDED) != 0;
+            // S8 (D1): the injected flags are the loop guard. An event
+            // with either flag set never remaps; the engine routes it
+            // to the injected lane (disable/Cat Lock still apply).
+            let injected =
+                (flags & LLKHF_INJECTED) != 0 || (flags & LLKHF_LOWER_IL_INJECTED) != 0;
 
             if let Some(key) = identify_key(kb.vkCode, kb.scanCode, extended) {
                 if let Some(shared) = SHARED.get() {
@@ -178,8 +184,29 @@ fn start_windows_hook() -> Result<HookStart, String> {
                     // sequence read here IS this event's sequence. No new
                     // blocking in the callback; the lock was already taken.
                     let mut engine = shared.engine.lock();
-                    let result = engine.process_event(key, is_up);
+                    let mut result = engine.process_event_injected(key, is_up, injected);
                     let seq = engine.event_sequence();
+                    // S8 (D3): execute injections synchronously, still
+                    // inside the callback, and only then return the
+                    // decision. One SendInput call per action list, no
+                    // waiting on delivery.
+                    if !result.inject.is_empty() {
+                        if let Err(err) =
+                            crate::keyboard::inject::execute_injections(&result.inject)
+                        {
+                            tracing::error!("remap injection failed ({err}); failing open");
+                            if let Some(source) = result.remapped_source {
+                                // The remap down never landed: roll the
+                                // optimistic held state back and forward
+                                // the physical key instead of consuming it.
+                                engine.cancel_held_remap(source);
+                                result.decision = HookDecision::Forward;
+                            }
+                            // A flush failure has no physical event to
+                            // forward; the stuck target is logged above
+                            // (loud) and the startup sweep is the backstop.
+                        }
+                    }
                     drop(engine);
                     match result.ui {
                         Some((_, UiPulse::Down)) => {
@@ -259,6 +286,18 @@ fn start_windows_hook() -> Result<HookStart, String> {
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+
+        // S8 (D8): release held remap targets BEFORE unhooking, while
+        // the hook is still installed: the ups pass through the hook as
+        // injected events and are forwarded (ADR §1.4).
+        if let Some(shared) = SHARED.get() {
+            let actions = shared.engine.lock().flush_remaps();
+            if !actions.is_empty() {
+                if let Err(err) = crate::keyboard::inject::execute_injections(&actions) {
+                    tracing::error!("shutdown remap flush failed ({err}); a remapped key may stick");
+                }
+            }
         }
 
         let _ = UnhookWindowsHookEx(hook);

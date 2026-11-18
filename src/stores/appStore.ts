@@ -8,6 +8,7 @@ import type {
   KeyboardLayout,
   MatchReason,
   Profile,
+  RemapRule,
 } from "../types/keyboard";
 import * as api from "../lib/tauri";
 import { setCustomLayouts } from "../lib/layouts";
@@ -132,6 +133,10 @@ interface AppStore {
   saveAppRule: (rule: AppRule) => Promise<void>;
   /** S5: delete one app rule. */
   removeAppRule: (id: string) => Promise<void>;
+  /** S8: create or update one remap rule (1:1) for the current profile. */
+  saveRemapRule: (rule: RemapRule) => Promise<void>;
+  /** S8: delete one remap rule (by source key) from the current profile. */
+  removeRemapRule: (from: string) => Promise<void>;
   /** S5: master switch for automatic profile switching. */
   setAutoProfileEnabled: (enabled: boolean) => Promise<void>;
   /** S5: clear the manual override and the safety pause, re-evaluating
@@ -554,6 +559,34 @@ export const useAppStore = create<AppStore>((set, get) => {
     const rev = beginCommand();
     try {
       await api.deleteAppRule(id);
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
+      const next = apply(snapshot);
+      if (next) set(next);
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      await fail(err);
+    }
+  },
+
+  saveRemapRule: async (rule) => {
+    const rev = beginCommand();
+    try {
+      await api.saveRemapRule(rule);
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
+      const next = apply(snapshot);
+      if (next) set(next);
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      await fail(err);
+    }
+  },
+
+  removeRemapRule: async (from) => {
+    const rev = beginCommand();
+    try {
+      await api.deleteRemapRule(from);
       const snapshot = await api.getAppState();
       if (!isCurrentCommand(rev)) return;
       const next = apply(snapshot);

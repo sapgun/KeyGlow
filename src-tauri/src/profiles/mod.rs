@@ -5,5 +5,7 @@ pub mod models;
 pub mod storage;
 
 pub use app_profiles::AppRule;
-pub use models::{AppConfig, Profile, DEFAULT_PROFILE_ID};
+pub use models::{
+    remap_participant, validate_remap_rule, AppConfig, Profile, RemapRule, DEFAULT_PROFILE_ID,
+};
 pub use storage::{load, save};

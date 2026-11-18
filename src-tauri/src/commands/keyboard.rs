@@ -198,6 +198,23 @@ pub fn set_key_enabled(
 ) -> Result<StateChangedPayload, String> {
     let entered = state.safety_epoch();
     let key = KeyCode::from_id(&code).ok_or_else(|| format!("unknown key: {code}"))?;
+    if !enabled {
+        // S8 (V3, second direction): disabling a key that participates
+        // in a remap rule of the effective profile is rejected — the
+        // injected target would be delivered anyway, so the combination
+        // would be a lie. Remove the rule first.
+        let effective = state.effective_profile_id();
+        let cfg = state.config.lock();
+        if let Some(profile) = cfg.profile(&effective) {
+            if let Some(rule) = crate::profiles::remap_participant(profile, &code) {
+                return Err(format!(
+                    "{code} is used by remap rule {} -> {}; remove the rule first",
+                    rule.from, rule.to
+                ));
+            }
+        }
+        drop(cfg);
+    }
     if enabled {
         state.controller.enable_key(key);
     } else {
@@ -240,7 +257,14 @@ pub fn set_key_enabled(
 #[tauri::command]
 pub fn enable_all_keys(app: AppHandle, state: State<AppState>) -> Result<StateChangedPayload, String> {
     let entered = state.safety_epoch();
-    state.controller.enable_all();
+    // S8: enable_all flushes held remap targets; execute the ups so no
+    // injected key sticks after the unlock.
+    let flushed = state.controller.enable_all();
+    if !flushed.is_empty() {
+        if let Err(err) = crate::keyboard::inject::execute_injections(&flushed) {
+            tracing::error!("enable-all remap flush failed ({err}); a remapped key may stick");
+        }
+    }
     {
         // S5: clear the *effective* profile's disabled set (see
         // set_key_enabled).

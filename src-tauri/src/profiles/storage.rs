@@ -150,6 +150,7 @@ mod tests {
             name: "Custom".into(),
             layout: "60-ansi".into(),
             disabled_keys: vec!["CapsLock".into()],
+            remappings: vec![],
             builtin: false,
         });
         // Activation invariant (HF-06): selected_layout follows the selected
@@ -279,6 +280,7 @@ mod tests {
                     name: format!("Racer {i}"),
                     layout: "60-ansi".into(),
                     disabled_keys: vec![],
+                    remappings: vec![],
                     builtin: false,
                 });
                 let data = serde_json::to_vec_pretty(&cfg).unwrap();

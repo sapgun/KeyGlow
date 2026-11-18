@@ -1,6 +1,6 @@
 use crate::keyboard::engine::KeyboardController;
 use crate::keyboard::hook::HookEvent;
-use crate::keyboard::{FilterEngine, HookExit, SafetyState};
+use crate::keyboard::{FilterEngine, HookExit, InjectAction, SafetyState};
 use parking_lot::Mutex;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -72,8 +72,8 @@ impl KeyboardController for UnsupportedController {
     fn disable_key(&self, key: crate::keyboard::KeyCode) {
         self.engine.lock().disable_key(key);
     }
-    fn enable_all(&self) {
-        self.engine.lock().enable_all();
+    fn enable_all(&self) -> Vec<InjectAction> {
+        self.engine.lock().enable_all()
     }
     fn is_enabled(&self, key: crate::keyboard::KeyCode) -> bool {
         self.engine.lock().is_enabled(key)
@@ -95,5 +95,14 @@ impl KeyboardController for UnsupportedController {
     }
     fn event_sequence(&self) -> u64 {
         self.engine.lock().event_sequence()
+    }
+    fn set_remap_rules(
+        &self,
+        rules: &[(crate::keyboard::KeyCode, crate::keyboard::KeyCode)],
+    ) -> Vec<InjectAction> {
+        self.engine.lock().set_remap_rules(rules)
+    }
+    fn flush_remaps(&self) -> Vec<InjectAction> {
+        self.engine.lock().flush_remaps()
     }
 }
