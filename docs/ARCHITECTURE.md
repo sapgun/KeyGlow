@@ -301,25 +301,56 @@ physical input state is never rolled back because the disk write failed.
 ## ADR: Content Security Policy (deferred — HF-09)
 
 `tauri.conf.json` ships with `csp: null`, meaning Tauri injects no CSP.
-This is a deliberate deferral, not an oversight:
+This is a deliberate deferral, not an oversight.
 
-- The frontend (`index.html` + Vite production bundle) uses no inline
-  scripts and no `innerHTML`/`dangerouslySetInnerHTML`, so a strict policy
-  like `default-src 'self'` is *plausible*.
-- But Tauri v2 IPC and the asset protocol have scheme requirements that
-  can only be confirmed against a real Windows build. Applying a guessed
-  CSP risks silently breaking IPC or the keyboard UI with no test catching
-  it on this branch.
-- Decision: keep `csp: null` until a Windows `tauri build` exists, then
-  apply the minimal verified policy and smoke-test every IPC command
-  (`get_pressed_snapshot`, profile CRUD, autostart, locale/theme) plus the
-  Cat Lock and emergency flows before keeping it.
+2026-11-18 finding — the old candidate policy is **disproven**, not just
+unverified. Evidence from the pinned toolchain itself:
 
-Candidate policy to verify (do not apply blind):
-`default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'`
-(`unsafe-inline` for styles only, because Tailwind/runtime style
-attributes may need it — confirm during the real-build verification and
-tighten if possible).
+- Tauri 2.11.5 (Cargo.lock) `scripts/ipc-protocol.js`: every `invoke`
+  goes through `fetch(convertFileSrc(cmd, 'ipc'))`, i.e. a `POST` to
+  `ipc://localhost/<cmd>` (`src/ipc/protocol.rs` handles that URI).
+  `fetch` is governed by CSP `connect-src`, which falls back to
+  `default-src`.
+- `default-src 'self'` covers only the app origin
+  (`https://tauri.localhost` in production,
+  `http://127.0.0.1:5173` in dev). `ipc://localhost` is a different
+  scheme and is **not** covered by `'self'`.
+- The pinned `@tauri-apps/api` 2.11.1 says so itself (`core.js:207`):
+  example CSP `"default-src 'self' ipc: http://ipc.localhost; img-src
+  'self' asset: http://asset.localhost"`.
+- Consequence of applying the old candidate
+  (`default-src 'self'; script-src 'self'; style-src 'self'
+  'unsafe-inline'`): every invoke fetch would be CSP-blocked and the
+  runtime would silently fall back to the `postMessage` IPC path for
+  every call (`ipc-protocol.js` has that fallback, with only a console
+  warning). The app would keep working on a degraded path with no test
+  catching it — exactly the silent-breakage risk this ADR warned about.
+
+Static surface re-checked 2026-11-18 (still clean): no inline scripts,
+no `innerHTML`/`dangerouslySetInnerHTML`, no `eval`/`new Function`, no
+external URLs, no `<img>` tags, no `convertFileSrc`/`asset:` use in
+`src/`; the Vite production bundle is one external module script plus
+one external stylesheet, favicon is same-origin `/icon.png`. So
+`script-src 'self'` and `style-src 'self' 'unsafe-inline'` remain
+plausible; the blocker is `connect-src` / the `ipc:` scheme.
+
+- Decision: keep `csp: null`. Do not apply either the old candidate or
+  the corrected one below without a real Windows Tauri run.
+- Corrected candidate to verify (do not apply blind):
+  `default-src 'self' ipc: http://ipc.localhost; script-src 'self';
+  style-src 'self' 'unsafe-inline'; img-src 'self' asset:
+  http://asset.localhost` (Tauri's own example, extended with the
+  existing style rule; `asset:` is included defensively — the app
+  currently uses no asset-protocol images, confirm and tighten if
+  possible).
+- Verification gate (all required before keeping any CSP): real Windows
+  `tauri build`; open DevTools and confirm zero CSP violations; confirm
+  IPC uses the fetch path (no "IPC custom protocol failed" warning,
+  which would mean the policy silently forced the postMessage
+  fallback); smoke-test every IPC command (`get_pressed_snapshot`,
+  profile CRUD, autostart, locale/theme) plus the Cat Lock and
+  emergency flows; repeat for dev (`http://127.0.0.1:5173`) and
+  production (`https://tauri.localhost`) origins.
 
 ## ADR: hook lifecycle contract (HF-07)
 
