@@ -38,7 +38,7 @@ pub fn spawn_foreground_observer(app: AppHandle) {
 #[cfg(windows)]
 fn observer_loop(app: &AppHandle) {
     let start = Instant::now();
-    let mut last_hwnd: isize = 0;
+    let mut last_hwnd: windows_sys::Win32::Foundation::HWND = std::ptr::null_mut();
     let mut last_pid: u32 = 0;
     let mut last_exe: Option<String> = None;
     loop {
@@ -83,7 +83,7 @@ fn emit_auto_switch(app: &AppHandle, state: &AppState, change: &EffectiveChange)
 
 #[cfg(windows)]
 fn query_foreground_exe_cached(
-    last_hwnd: &mut isize,
+    last_hwnd: &mut windows_sys::Win32::Foundation::HWND,
     last_pid: &mut u32,
     last_exe: &mut Option<String>,
 ) -> Option<String> {
@@ -93,8 +93,8 @@ fn query_foreground_exe_cached(
 
     unsafe {
         let hwnd = GetForegroundWindow();
-        if hwnd == 0 {
-            *last_hwnd = 0;
+        if hwnd.is_null() {
+            *last_hwnd = std::ptr::null_mut();
             *last_pid = 0;
             *last_exe = None;
             return None;
@@ -126,7 +126,7 @@ fn query_process_exe(pid: u32) -> Option<String> {
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle == 0 {
+        if handle.is_null() {
             return None;
         }
         let mut buf = [0u16; 1024];
