@@ -434,6 +434,7 @@ mod layout_tests {
     fn layouts_are_valid() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src/layouts");
         let mut found = 0;
+        let mut ids = HashSet::new();
         for entry in fs::read_dir(&dir).expect("layouts dir") {
             let path = entry.unwrap().path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
@@ -442,6 +443,7 @@ mod layout_tests {
             found += 1;
             let layout: Layout =
                 serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            ids.insert(layout.id.clone());
             let mut codes = HashSet::new();
             for key in &layout.keys {
                 assert!(key.w > 0.0 && key.h > 0.0, "{} has non-positive size", key.code);
@@ -462,6 +464,18 @@ mod layout_tests {
                 }
             }
         }
-        assert_eq!(found, 5, "expected five layout files");
+        assert_eq!(found, 7, "expected seven layout files");
+        // S6: 5 ANSI + ISO + JIS.
+        for id in [
+            "fullsize-ansi",
+            "tkl-ansi",
+            "75-ansi",
+            "65-ansi",
+            "60-ansi",
+            "fullsize-iso",
+            "fullsize-jis",
+        ] {
+            assert!(ids.contains(id), "missing layout {id}");
+        }
     }
 }
