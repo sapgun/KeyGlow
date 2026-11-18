@@ -2,6 +2,7 @@ use crate::keyboard::KeyCode;
 use crate::profiles::models::VALID_LAYOUT_IDS;
 use crate::state::AppState;
 use serde::Serialize;
+use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, State};
 
 #[derive(Serialize)]
@@ -28,6 +29,63 @@ pub struct AppSnapshot {
     pub persist_error_kind: Option<String>,
     /// Increments after every successful persist.
     pub config_revision: u64,
+    /// Latest emergency epoch recorded by the hook at snapshot time (P3).
+    pub safety_epoch: u64,
+    /// Highest emergency epoch fully converged at snapshot time (P3).
+    pub safety_reconciled: u64,
+    /// Monotonic runtime-state revision (P3). Distinct from
+    /// `config_revision`: this orders runtime state, that one orders disk
+    /// writes. Never compare the two against each other.
+    pub runtime_revision: u64,
+}
+
+/// Ordering envelope for state-affecting native events (P3). The UI applies
+/// an event only when (safety_epoch, runtime_revision) is not older than
+/// what it already shows, so a late or duplicate event can never overwrite
+/// newer state (e.g. post-emergency truth).
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StateChangedPayload {
+    pub keys: Vec<String>,
+    pub safety_epoch: u64,
+    pub runtime_revision: u64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CatLockPayload {
+    pub locked: bool,
+    pub safety_epoch: u64,
+    pub runtime_revision: u64,
+}
+
+/// Emitted only after an emergency epoch fully converged (P3). Carries the
+/// converged epoch so the UI can floor its ordering stamp: anything older
+/// (a late hydrate, a stale command response) is discarded instead of
+/// overwriting the safe state.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct EmergencyPayload {
+    pub epoch: u64,
+    pub runtime_revision: u64,
+}
+
+pub(crate) fn state_changed_payload(state: &AppState) -> StateChangedPayload {
+    let (safety_epoch, runtime_revision) = state.event_stamp();
+    StateChangedPayload {
+        keys: state.snapshot_disabled(),
+        safety_epoch,
+        runtime_revision,
+    }
+}
+
+fn cat_lock_payload(state: &AppState, locked: bool) -> CatLockPayload {
+    let (safety_epoch, runtime_revision) = state.event_stamp();
+    CatLockPayload {
+        locked,
+        safety_epoch,
+        runtime_revision,
+    }
 }
 
 #[tauri::command]
@@ -52,6 +110,9 @@ pub fn get_app_state(state: State<AppState>) -> AppSnapshot {
         persist_error,
         persist_error_kind,
         config_revision,
+        safety_epoch: state.safety.epoch(),
+        safety_reconciled: state.safety.reconciled_epoch(),
+        runtime_revision: state.runtime_revision.load(Ordering::SeqCst),
     }
 }
 
@@ -67,7 +128,7 @@ pub fn set_key_enabled(
     state: State<AppState>,
     code: String,
     enabled: bool,
-) -> Result<Vec<String>, String> {
+) -> Result<StateChangedPayload, String> {
     let entered = state.safety_epoch();
     let key = KeyCode::from_id(&code).ok_or_else(|| format!("unknown key: {code}"))?;
     if enabled {
@@ -87,25 +148,26 @@ pub fn set_key_enabled(
             }
         }
     }
+    // Order this mutation for the UI (P3), before the staleness checks below.
+    state.bump_runtime_revision();
     if state.safety.epoch() != entered {
         // Emergency press landed mid-command: discard, never persist stale.
         crate::discard_stale_command(&app, &state, "superseded mid-command");
-        return Ok(state.snapshot_disabled());
+        return Ok(state_changed_payload(&state));
     }
     state.persist()?;
     if state.safety.epoch() != entered {
         // Emergency press landed during persist: the stale write may have
         // beaten the worker's convergence to disk; force safe state back.
         crate::discard_stale_command(&app, &state, "superseded during persist");
-        return Ok(state.snapshot_disabled());
+        return Ok(state_changed_payload(&state));
     }
-    let disabled = state.snapshot_disabled();
-    let _ = app.emit("keyboard:state-changed", &disabled);
-    Ok(disabled)
+    let _ = app.emit("keyboard:state-changed", state_changed_payload(&state));
+    Ok(state_changed_payload(&state))
 }
 
 #[tauri::command]
-pub fn enable_all_keys(app: AppHandle, state: State<AppState>) -> Result<Vec<String>, String> {
+pub fn enable_all_keys(app: AppHandle, state: State<AppState>) -> Result<StateChangedPayload, String> {
     let entered = state.safety_epoch();
     state.controller.enable_all();
     {
@@ -114,35 +176,37 @@ pub fn enable_all_keys(app: AppHandle, state: State<AppState>) -> Result<Vec<Str
             profile.disabled_keys.clear();
         }
     }
+    state.bump_runtime_revision();
     if state.safety.epoch() != entered {
         crate::discard_stale_command(&app, &state, "superseded mid-command");
-        return Ok(state.snapshot_disabled());
+        return Ok(state_changed_payload(&state));
     }
     state.persist()?;
     if state.safety.epoch() != entered {
         crate::discard_stale_command(&app, &state, "superseded during persist");
-        return Ok(state.snapshot_disabled());
+        return Ok(state_changed_payload(&state));
     }
-    let disabled = state.snapshot_disabled();
-    let _ = app.emit("keyboard:state-changed", &disabled);
-    let _ = app.emit("keyboard:cat-lock", false);
+    let _ = app.emit("keyboard:state-changed", state_changed_payload(&state));
+    let _ = app.emit("keyboard:cat-lock", cat_lock_payload(&state, false));
     tracing::info!("enable all keys");
-    Ok(disabled)
+    Ok(state_changed_payload(&state))
 }
 
 #[tauri::command]
-pub fn set_cat_lock(app: AppHandle, state: State<AppState>, locked: bool) -> Result<bool, String> {
+pub fn set_cat_lock(app: AppHandle, state: State<AppState>, locked: bool) -> Result<CatLockPayload, String> {
     let entered = state.safety_epoch();
     state.controller.set_cat_lock(locked);
+    // Runtime state changed even though cat lock never touches the disk (P3).
+    state.bump_runtime_revision();
     if state.safety.epoch() != entered {
         // A stale lock/unlock must not override the post-emergency state.
         crate::discard_stale_command(&app, &state, "superseded mid-command");
-        return Ok(false);
+        return Ok(cat_lock_payload(&state, false));
     }
-    let _ = app.emit("keyboard:cat-lock", locked);
+    let _ = app.emit("keyboard:cat-lock", cat_lock_payload(&state, locked));
     crate::tray::refresh(&app);
     tracing::info!(locked, "cat lock");
-    Ok(locked)
+    Ok(cat_lock_payload(&state, locked))
 }
 
 #[tauri::command]
@@ -158,6 +222,7 @@ pub fn select_layout(app: AppHandle, state: State<AppState>, id: String) -> Resu
         }
         cfg.onboarded = true;
     }
+    state.bump_runtime_revision();
     state.persist()?;
     let _ = app.emit("profile:changed", state.config.lock().clone());
     Ok(())
@@ -166,6 +231,7 @@ pub fn select_layout(app: AppHandle, state: State<AppState>, id: String) -> Resu
 #[tauri::command]
 pub fn set_onboarded(state: State<AppState>, onboarded: bool) -> Result<(), String> {
     state.config.lock().onboarded = onboarded;
+    state.bump_runtime_revision();
     state.persist()
 }
 
@@ -177,6 +243,7 @@ pub fn set_start_with_windows(
 ) -> Result<bool, String> {
     apply_autostart(&app, enabled)?;
     state.config.lock().start_with_windows = enabled;
+    state.bump_runtime_revision();
     state.persist()?;
     Ok(enabled)
 }
@@ -190,6 +257,7 @@ pub fn set_locale(app: AppHandle, state: State<AppState>, locale: String) -> Res
         _ => return Err(format!("unsupported locale: {locale}")),
     };
     state.config.lock().locale = normalized.to_string();
+    state.bump_runtime_revision();
     state.persist()?;
     crate::tray::refresh(&app);
     Ok(normalized.to_string())
@@ -203,6 +271,7 @@ pub fn set_theme(state: State<AppState>, theme: String) -> Result<String, String
         _ => return Err(format!("unsupported theme: {theme}")),
     };
     state.config.lock().theme = normalized.to_string();
+    state.bump_runtime_revision();
     state.persist()?;
     Ok(normalized.to_string())
 }

@@ -1,6 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AppSnapshot, PressedSnapshot, Profile } from "../types/keyboard";
+import type {
+  AppSnapshot,
+  CatLockPayload,
+  EmergencyPayload,
+  PressedSnapshot,
+  Profile,
+  StateChangedPayload,
+} from "../types/keyboard";
 
 export function getAppState() {
   return invoke<AppSnapshot>("get_app_state");
@@ -11,15 +18,17 @@ export function getPressedSnapshot() {
 }
 
 export function setKeyEnabled(code: string, enabled: boolean) {
-  return invoke<string[]>("set_key_enabled", { code, enabled });
+  // P3: the response carries the native ordering stamp (keys + stamp),
+  // applied through the same gate as events/snapshots.
+  return invoke<StateChangedPayload>("set_key_enabled", { code, enabled });
 }
 
 export function enableAllKeys() {
-  return invoke<string[]>("enable_all_keys");
+  return invoke<StateChangedPayload>("enable_all_keys");
 }
 
 export function setCatLock(locked: boolean) {
-  return invoke<boolean>("set_cat_lock", { locked });
+  return invoke<CatLockPayload>("set_cat_lock", { locked });
 }
 
 export function selectLayout(id: string) {
@@ -83,32 +92,97 @@ function payloadCode(payload: unknown): string | null {
   return null;
 }
 
-export function onKeyDown(handler: (code: string) => void): Promise<UnlistenFn> {
+/** Extract {code, seq} from a key event payload (P3). Legacy bare-string
+ * payloads yield an undefined seq, which the store treats as unordered. */
+function payloadPress(payload: unknown): { code: string; seq?: number } | null {
+  const code = payloadCode(payload);
+  if (!code) return null;
+  if (payload && typeof payload === "object" && "seq" in payload) {
+    const seq = (payload as { seq: unknown }).seq;
+    if (typeof seq === "number" && Number.isFinite(seq)) {
+      return { code, seq };
+    }
+  }
+  return { code };
+}
+
+function payloadStateChanged(payload: unknown): StateChangedPayload | null {
+  if (payload && typeof payload === "object" && "keys" in payload) {
+    const p = payload as Partial<StateChangedPayload>;
+    if (
+      Array.isArray(p.keys) &&
+      typeof p.safetyEpoch === "number" &&
+      typeof p.runtimeRevision === "number"
+    ) {
+      return { keys: p.keys, safetyEpoch: p.safetyEpoch, runtimeRevision: p.runtimeRevision };
+    }
+  }
+  return null;
+}
+
+function payloadCatLock(payload: unknown): CatLockPayload | null {
+  if (payload && typeof payload === "object" && "locked" in payload) {
+    const p = payload as Partial<CatLockPayload>;
+    if (
+      typeof p.locked === "boolean" &&
+      typeof p.safetyEpoch === "number" &&
+      typeof p.runtimeRevision === "number"
+    ) {
+      return { locked: p.locked, safetyEpoch: p.safetyEpoch, runtimeRevision: p.runtimeRevision };
+    }
+  }
+  return null;
+}
+
+function payloadEmergency(payload: unknown): EmergencyPayload | null {
+  if (payload && typeof payload === "object" && "epoch" in payload) {
+    const p = payload as Partial<EmergencyPayload>;
+    if (typeof p.epoch === "number" && typeof p.runtimeRevision === "number") {
+      return { epoch: p.epoch, runtimeRevision: p.runtimeRevision };
+    }
+  }
+  return null;
+}
+
+export function onKeyDown(handler: (code: string, seq?: number) => void): Promise<UnlistenFn> {
   return listen<unknown>("keyboard:key-down", (event) => {
-    const code = payloadCode(event.payload);
-    if (code) handler(code);
+    const press = payloadPress(event.payload);
+    if (press) handler(press.code, press.seq);
   });
 }
 
-export function onKeyUp(handler: (code: string) => void): Promise<UnlistenFn> {
+export function onKeyUp(handler: (code: string, seq?: number) => void): Promise<UnlistenFn> {
   return listen<unknown>("keyboard:key-up", (event) => {
-    const code = payloadCode(event.payload);
-    if (code) handler(code);
+    const press = payloadPress(event.payload);
+    if (press) handler(press.code, press.seq);
   });
 }
 
-export function onStateChanged(handler: (keys: string[]) => void): Promise<UnlistenFn> {
-  return listen<string[]>("keyboard:state-changed", (event) => handler(event.payload));
+export function onStateChanged(
+  handler: (payload: StateChangedPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<unknown>("keyboard:state-changed", (event) => {
+    const payload = payloadStateChanged(event.payload);
+    if (payload) handler(payload);
+  });
 }
 
-export function onEmergencyUnlock(handler: () => void): Promise<UnlistenFn> {
-  return listen("keyboard:emergency-unlock", () => handler());
+export function onEmergencyUnlock(handler: (payload: EmergencyPayload) => void): Promise<UnlistenFn> {
+  return listen<unknown>("keyboard:emergency-unlock", (event) => {
+    const payload = payloadEmergency(event.payload);
+    // The event always carries the converged epoch; a missing payload
+    // means a protocol mismatch, which must not silently unlock.
+    if (payload) handler(payload);
+  });
 }
 
 export function onProfileChanged(handler: () => void): Promise<UnlistenFn> {
   return listen("profile:changed", () => handler());
 }
 
-export function onCatLock(handler: (locked: boolean) => void): Promise<UnlistenFn> {
-  return listen<boolean>("keyboard:cat-lock", (event) => handler(Boolean(event.payload)));
+export function onCatLock(handler: (payload: CatLockPayload) => void): Promise<UnlistenFn> {
+  return listen<unknown>("keyboard:cat-lock", (event) => {
+    const payload = payloadCatLock(event.payload);
+    if (payload) handler(payload);
+  });
 }

@@ -154,6 +154,13 @@ stays in English.
 
 ## Test 13 — Long hold keeps its glow (HF-04)
 
+Automated (CI, `npm test` → `scripts/test-store-contract.mjs` T6): the
+ordering of key events vs. pressed-snapshot responses is verified —
+a snapshot older than a processed key-down must not drop the key, a newer
+snapshot governs, stale key events are ignored.
+
+Physical (not covered by automation — needs the rig):
+
 1. Open Notepad (or any other app) and hold the `A` key for 12 seconds.
    Expected: the KeyGlow window keeps `A` lit the whole time. It must NOT
    go dark at 8 seconds while the key is still physically held.
@@ -163,6 +170,12 @@ stays in English.
 3. Release the key. Expected: the glow clears within a second.
 
 ## Test 14 — Dropped key-up recovery (HF-04)
+
+Automated (CI, `npm test` → `scripts/test-store-contract.mjs` T6): snapshot
+merge logic is verified — keys touched by events newer than the snapshot
+are kept, the rest follow the snapshot.
+
+Physical (not covered by automation — needs the rig):
 
 1. Hold a key in an external app, then hide the KeyGlow window
    (close to tray) and release the key.
@@ -215,3 +228,33 @@ stays in English.
    Expected: no stuck keys after either; the low-level hook is released.
 5. Sleep/resume with the app running.
    Expected: filtering resumes; no ghost pressed keys (see Test 14).
+
+## Test 19 — Stale snapshot/event ordering (P3)
+
+Automated (CI, `npm test` → `scripts/test-store-contract.mjs`, 28
+assertions; Rust unit tests in `state.rs` run via `npm run test:rust` on
+Windows CI): the real store and the real IPC payload parsing are driven
+against a fake native layer with hostile timing —
+
+- T1: hydrate requested before an emergency, resolved after → dropped.
+- T2: older-revision `state-changed` after a newer one → dropped.
+- T3: toggle invalidated by emergency → late response dropped, unlock kept.
+- T4: failed command → optimistic update rolled back, stale recovery
+  snapshot dropped, error still surfaced.
+- T5: command response stamped older than displayed state → dropped.
+- T6: pressed-snapshot older than a processed key-down → key kept;
+  newer snapshot governs; stale key events ignored.
+- T7: older safety epoch never wins, even with a higher revision.
+- T8: malformed event payloads ignored; a malformed emergency payload
+  never triggers the unlock path.
+- Rust: `runtime_revision` increments per mutation; emergency convergence
+  bumps it even when persist fails; `persisted_revision` (disk) and
+  `runtime_revision` (state) stay independent.
+
+Physical (not covered by automation — needs the rig):
+
+1. Disable `A`, then trigger emergency unlock, then (before the UI
+   settles) switch profiles rapidly. Expected: the UI ends on Default,
+   all keys enabled; no disabled key from the old profile reappears.
+2. With DevTools throttling the network/IPC, hold a key for 12s and
+   release. Expected: no stuck glow, no dropped held key.

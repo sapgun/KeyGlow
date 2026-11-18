@@ -55,18 +55,36 @@ export default function App() {
     // silently on a single rejection).
     const subscribe = (async () => {
       const results = await Promise.allSettled([
-        api.onKeyDown((code) => useAppStore.getState().notePress(code, true)),
-        api.onKeyUp((code) => useAppStore.getState().notePress(code, false)),
-        api.onStateChanged((keys) => useAppStore.setState({ disabledKeys: keys })),
-        api.onEmergencyUnlock(() => {
-          useAppStore.getState().showEmergency();
+        api.onKeyDown((code, seq) => useAppStore.getState().notePress(code, true, seq)),
+        api.onKeyUp((code, seq) => useAppStore.getState().notePress(code, false, seq)),
+        // P3: state-affecting native events go through the ordering gate —
+        // a late/duplicate event can never overwrite newer state.
+        api.onStateChanged((payload) =>
+          useAppStore
+            .getState()
+            .applyNativeEvent(
+              { disabledKeys: payload.keys },
+              payload.safetyEpoch,
+              payload.runtimeRevision,
+            ),
+        ),
+        api.onEmergencyUnlock((payload) => {
+          useAppStore.getState().showEmergency(payload);
           void useAppStore.getState().hydrate();
           void useAppStore.getState().resyncPressed();
         }),
         api.onProfileChanged(() => {
           void useAppStore.getState().hydrate();
         }),
-        api.onCatLock((locked) => useAppStore.setState({ catLock: locked })),
+        api.onCatLock((payload) =>
+          useAppStore
+            .getState()
+            .applyNativeEvent(
+              { catLock: payload.locked },
+              payload.safetyEpoch,
+              payload.runtimeRevision,
+            ),
+        ),
       ]);
       const fns: Array<() => void> = [];
       let failure: unknown = null;

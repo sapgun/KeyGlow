@@ -28,6 +28,14 @@ pub struct AppState {
     pub(crate) persist_lock: Mutex<()>,
     /// Incremented after every successful persist.
     pub persisted_revision: AtomicU64,
+    /// Monotonic runtime-state revision (P3). Bumped once per runtime state
+    /// mutation (mutating commands, emergency convergence), regardless of
+    /// whether the change reached the disk. This is the ordering key the UI
+    /// uses to discard stale snapshots/events; it is deliberately distinct
+    /// from `persisted_revision`, which only tracks successful disk writes
+    /// (a best-effort emergency persist may fail while the runtime state
+    /// still changed, and some runtime state never persists at all).
+    pub runtime_revision: AtomicU64,
     /// Last persist failure, if the on-disk config is stale.
     pub persist_error: Mutex<Option<String>>,
     /// Machine-readable kind of the last failure (for translated UI).
@@ -68,6 +76,21 @@ impl AppState {
     /// Best-effort re-save after a failure (UI "Retry" action).
     pub fn retry_persist(&self) -> Result<(), String> {
         self.persist()
+    }
+
+    /// Record a runtime state mutation for UI ordering (P3). Call exactly
+    /// once per mutating command / convergence, after the mutation landed.
+    pub fn bump_runtime_revision(&self) {
+        self.runtime_revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Current ordering stamp for native event payloads (P3):
+    /// (latest safety epoch, current runtime revision).
+    pub fn event_stamp(&self) -> (u64, u64) {
+        (
+            self.safety.epoch(),
+            self.runtime_revision.load(Ordering::SeqCst),
+        )
     }
 
     /// (persisted, last error, error kind, revision) for the UI snapshot.
@@ -124,6 +147,9 @@ impl AppState {
                 profile.disabled_keys.clear();
             }
         }
+        // The runtime state changed (controller + config); order it for the
+        // UI even though the persist below is best-effort (P3).
+        self.bump_runtime_revision();
         if let Err(err) = self.persist() {
             // Best effort by design: physical keys stay enabled regardless of
             // disk state. The error is recorded (not swallowed) so the UI can
@@ -202,6 +228,7 @@ mod tests {
             safety: Arc::new(SafetyState::new()),
             persist_lock: Mutex::new(()),
             persisted_revision: AtomicU64::new(0),
+            runtime_revision: AtomicU64::new(0),
             persist_error: Mutex::new(None),
             persist_error_kind: Mutex::new(None),
         }
@@ -389,6 +416,70 @@ mod tests {
         let raw = std::fs::read_to_string(dir.join("settings.json")).unwrap();
         let parsed: AppConfig = serde_json::from_str(&raw).expect("valid JSON");
         assert_eq!(parsed.version, crate::profiles::models::CONFIG_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- P3: runtime revision ordering ----
+
+    #[test]
+    fn runtime_revision_starts_at_zero_and_increments() {
+        let dir = unique_temp_path("rt_rev");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(dir.join("settings.json"));
+        assert_eq!(state.runtime_revision.load(Ordering::SeqCst), 0);
+        assert_eq!(state.event_stamp(), (0, 0));
+        state.bump_runtime_revision();
+        state.bump_runtime_revision();
+        assert_eq!(state.runtime_revision.load(Ordering::SeqCst), 2);
+        assert_eq!(state.event_stamp(), (0, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emergency_unlock_bumps_runtime_revision_even_when_persist_fails() {
+        // P3 core distinction: the convergence mutates runtime state
+        // (controller + config), so it must advance the UI ordering
+        // revision even when the best-effort persist fails.
+        // persisted_revision counts disk writes; runtime_revision counts
+        // state mutations. They are different numbers on purpose.
+        //
+        // save() creates missing parent dirs, so a missing dir is NOT a
+        // failure. Use a blocker *file* as the parent: create_dir_all on
+        // a file path fails on every platform.
+        let blocker = unique_temp_path("rt_emg_blocker");
+        File::create(&blocker).unwrap();
+        let state = test_state(blocker.join("settings.json"));
+        // Sanity: this persist really does fail in this fixture.
+        assert!(state.persist().is_err());
+        assert_eq!(state.persisted_revision.load(Ordering::SeqCst), 0);
+
+        state.emergency_unlock();
+
+        assert_eq!(
+            state.runtime_revision.load(Ordering::SeqCst),
+            1,
+            "convergence changed runtime state, so the UI ordering revision must advance"
+        );
+        assert_eq!(
+            state.persisted_revision.load(Ordering::SeqCst),
+            0,
+            "failed persist must not advance the disk revision"
+        );
+        // Physical recovery happened regardless of the disk failure.
+        assert!(state.snapshot_disabled().is_empty());
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn event_stamp_tracks_safety_epoch_and_runtime_revision() {
+        let dir = unique_temp_path("rt_stamp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(dir.join("settings.json"));
+        state.bump_runtime_revision();
+        let epoch = state.safety.trigger();
+        // A trigger alone does not mutate runtime state: the stamp's
+        // revision part only moves on bump_runtime_revision().
+        assert_eq!(state.event_stamp(), (epoch, 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

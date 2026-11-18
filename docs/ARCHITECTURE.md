@@ -147,6 +147,70 @@ bounded. No change: the cost is negligible at human press rates and the
 hook already does more (engine lock, key identification). Do not claim
 allocation-free/lock-free/bounded.
 
+## ADR: UI snapshot/event ordering (P3)
+
+**Defect (reproduced in tests):** the local command counter (`cmdRev`)
+could not order `hydrate()` or native events — they bypass it. A hydrate
+requested before an emergency but resolved after it overwrote the safe
+state with pre-emergency disabled keys; a `keyboard:state-changed` event
+from the previous profile arriving after a profile switch overwrote the
+new profile's state; and a pressed-snapshot response older than an
+already-processed key-down dropped the physically held key.
+
+**Design:** native issues one ordering stamp; the UI applies data only
+when the stamp is not older than what is displayed.
+
+Native (`AppState`):
+
+- `safety.epoch()` — latest emergency recorded by the hook.
+- `safety.reconciled_epoch()` — highest epoch fully converged (P2).
+- `runtime_revision: AtomicU64` — bumped once per runtime-state mutation
+  (every mutating command, emergency convergence), regardless of whether
+  the change reached the disk.
+
+`AppSnapshot` carries `safetyEpoch`, `safetyReconciled`, `runtimeRevision`.
+State-affecting events carry the same stamp:
+
+- `keyboard:state-changed` → `{ keys, safetyEpoch, runtimeRevision }`
+- `keyboard:cat-lock` → `{ locked, safetyEpoch, runtimeRevision }`
+- `keyboard:emergency-unlock` → `{ epoch, runtimeRevision }` — emitted
+  only after the epoch fully converged, so it is authoritative truth.
+- `keyboard:key-down` / `keyboard:key-up` → `{ code, seq }` — the
+  engine's event sequence for that press.
+
+UI rule (single rule, applied to command responses, hydrate snapshots,
+and native events): apply only if
+`(epoch, rev) >= (appliedEpoch, appliedRev)`, epoch compared first.
+Otherwise discard. The emergency event floors the stamp to the converged
+epoch, so anything older (a late hydrate, a stale response) is dropped
+instead of overwriting the safe state.
+
+Two revisions, never confused:
+
+- `runtimeRevision` — orders runtime state for the UI. Bumped on every
+  mutation, even when persist fails (emergency best-effort) or never
+  happens (cat lock). Never compare against `configRevision`.
+- `configRevision` (`persisted_revision`) — counts successful disk writes
+  only. Answers "is the file in sync?", not "what is the newest state?".
+
+Pressed keys live in a separate sequence domain: the UI keeps the last
+native `seq` per key. A snapshot older than a processed key event must
+not drop that key (order inversion); a newer snapshot governs. Missing
+events are recovered by the next snapshot, which always carries a stamp
+at least as new as any event it postdates.
+
+Command responses for the three value-returning commands
+(`set_key_enabled`, `enable_all_keys`, `set_cat_lock`) now return their
+payload with the stamp (`{ keys, safetyEpoch, runtimeRevision }` /
+`{ locked, safetyEpoch, runtimeRevision }`) and go through the same gate
+— no separate "response is newer than the event" logic, no extra IPC.
+
+**Not claimed:** physical 10-second hold display and dropped key-up
+recovery are covered by automated ordering tests
+(`scripts/test-store-contract.mjs`, run in CI via `npm test`), but the
+real 10s hold and the real dropped key-up still need the physical rig
+(Test 13/14) — automated and physical are recorded separately.
+
 ## ADR: safe settings replace (HF-02)
 
 `profiles/storage.rs::atomic_write` replaces `settings.json` as follows:

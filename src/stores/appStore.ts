@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { AppSnapshot, Profile } from "../types/keyboard";
+import type { AppSnapshot, EmergencyPayload, Profile } from "../types/keyboard";
 import * as api from "../lib/tauri";
 import { detectLocale, parseLocale, type Locale } from "../i18n";
 import { applyTheme, parseTheme, readStoredTheme, type Theme } from "../lib/theme";
@@ -7,6 +7,34 @@ import { applyTheme, parseTheme, readStoredTheme, type Theme } from "../lib/them
 // HF-04: after this long without a key-up, the UI does NOT drop the key.
 // It marks the key stale and re-checks the native pressed snapshot instead.
 const PRESS_STALE_CHECK_MS = 8000;
+
+// P3: authoritative ordering. Native stamps every snapshot and
+// state-affecting event with (safetyEpoch, runtimeRevision). The UI applies
+// data only when it is not older than what is already displayed:
+//   (epoch, rev) >= (appliedEpoch, appliedRev), epoch compared first.
+// The local command counter (cmdRev) cannot cover hydrate() or native
+// events — they bypass it — so a late hydrate or a stale state-changed
+// event could overwrite newer (e.g. post-emergency) state. This stamp
+// covers command responses, hydrate snapshots, and native events uniformly.
+//
+// configRevision (persisted_revision) is a different number: it counts
+// successful disk writes, not runtime mutations. Never compare the two.
+let appliedEpoch = 0;
+let appliedRev = 0;
+const isFreshStamp = (epoch: number, rev: number) =>
+  epoch > appliedEpoch || (epoch === appliedEpoch && rev >= appliedRev);
+const markAppliedStamp = (epoch: number, rev: number) => {
+  if (isFreshStamp(epoch, rev)) {
+    appliedEpoch = epoch;
+    appliedRev = rev;
+  }
+};
+
+// P3: native event sequence per key. Key-down/up events carry the engine's
+// sequence; a pressed-snapshot response carries the sequence it was taken
+// at. A snapshot older than an already-processed key event must not drop
+// that key from the display.
+const keyPressSeq = new Map<string, number>();
 
 interface AppStore {
   hydrated: boolean;
@@ -34,6 +62,12 @@ interface AppStore {
   configRevision: number;
   hydrate: () => Promise<void>;
   applySnapshot: (snapshot: AppSnapshot) => void;
+  /**
+   * P3: apply a native event's partial state only when its stamp is not
+   * older than what is displayed. Late/duplicate events are dropped, so
+   * they can never overwrite newer (e.g. post-emergency) state.
+   */
+  applyNativeEvent: (partial: Partial<AppStore>, epoch: number, rev: number) => void;
   toggleKey: (code: string) => Promise<void>;
   enableAll: () => Promise<void>;
   chooseLayout: (id: string) => Promise<void>;
@@ -49,15 +83,19 @@ interface AppStore {
   setTheme: (theme: Theme) => Promise<void>;
   toggleCatLock: () => Promise<void>;
   retryPersist: () => Promise<void>;
-  notePress: (code: string, down: boolean) => void;
+  notePress: (code: string, down: boolean, seq?: number) => void;
   verifyHeldKey: (code: string) => Promise<void>;
   resyncPressed: () => Promise<void>;
   clearPressTracking: () => void;
   clearEmergency: () => void;
-  showEmergency: () => void;
+  showEmergency: (payload: EmergencyPayload) => void;
 }
 
-function apply(snapshot: AppSnapshot): Partial<AppStore> {
+function apply(snapshot: AppSnapshot): Partial<AppStore> | null {
+  // P3: a snapshot that predates what is displayed is stale — drop it
+  // instead of overwriting newer (e.g. post-emergency) state.
+  if (!isFreshStamp(snapshot.safetyEpoch, snapshot.runtimeRevision)) return null;
+  markAppliedStamp(snapshot.safetyEpoch, snapshot.runtimeRevision);
   return {
     hydrated: true,
     hookActive: snapshot.hookActive,
@@ -116,10 +154,13 @@ export const useAppStore = create<AppStore>((set, get) => {
   // also carries the sticky persist state (persisted/persistError), so an
   // unsaved-settings banner survives until a retry succeeds. No rejected
   // promise ever escapes a store action.
+  // P3: the recovery snapshot is stamped too — a stale one must not
+  // overwrite newer state, but the error is still surfaced.
   const fail = async (err: unknown) => {
     try {
       const snapshot = await api.getAppState();
-      set({ ...apply(snapshot), error: String(err) });
+      const next = apply(snapshot);
+      set({ ...(next ?? {}), error: String(err) });
     } catch {
       set({ error: String(err) });
     }
@@ -150,12 +191,24 @@ export const useAppStore = create<AppStore>((set, get) => {
   persistErrorKind: null,
   configRevision: 0,
 
-  applySnapshot: (snapshot) => set(apply(snapshot)),
+  applySnapshot: (snapshot) => {
+    const next = apply(snapshot);
+    if (next) set(next);
+  },
+  applyNativeEvent: (partial, epoch, rev) => {
+    if (!isFreshStamp(epoch, rev)) return;
+    markAppliedStamp(epoch, rev);
+    set(partial);
+  },
   hydrate: async () => {
     const snapshot = await api.getAppState();
+    const next = apply(snapshot);
+    // P3: a hydrate requested before an emergency (or a profile switch)
+    // may resolve after newer state was applied — drop it.
+    if (!next) return;
     const locale = parseLocale(snapshot.locale) ?? detectLocale();
     const theme = parseTheme(snapshot.theme) ?? readStoredTheme();
-    set({ ...apply(snapshot), locale, theme });
+    set({ ...next, locale, theme });
     document.documentElement.lang = locale;
     applyTheme(theme);
     if (!parseLocale(snapshot.locale)) {
@@ -169,19 +222,31 @@ export const useAppStore = create<AppStore>((set, get) => {
   toggleKey: async (code) => {
     if (get().catLock) return;
     const rev = beginCommand();
-    const disabled = get().disabledKeys.includes(code);
+    const prevKeys = get().disabledKeys;
+    const disabled = prevKeys.includes(code);
     const nextEnabled = disabled;
     set({
       disabledKeys: disabled
-        ? get().disabledKeys.filter((k) => k !== code)
-        : [...get().disabledKeys, code],
+        ? prevKeys.filter((k) => k !== code)
+        : [...prevKeys, code],
     });
     try {
-      const keys = await api.setKeyEnabled(code, nextEnabled);
+      const res = await api.setKeyEnabled(code, nextEnabled);
       if (!isCurrentCommand(rev)) return;
-      set({ disabledKeys: keys, error: null });
+      // P3: the response carries its native stamp. Apply it through the
+      // same ordering gate as events/snapshots: a newer event or snapshot
+      // may already have covered (or superseded) this command.
+      get().applyNativeEvent(
+        { disabledKeys: res.keys, error: null },
+        res.safetyEpoch,
+        res.runtimeRevision,
+      );
     } catch (err) {
       if (!isCurrentCommand(rev)) return;
+      // Roll back the optimistic update; fail() then re-pulls the
+      // authoritative snapshot (guarded, so a stale recovery snapshot
+      // cannot overwrite newer state either).
+      set({ disabledKeys: prevKeys });
       await fail(err);
     }
   },
@@ -189,9 +254,13 @@ export const useAppStore = create<AppStore>((set, get) => {
   enableAll: async () => {
     const rev = beginCommand();
     try {
-      const keys = await api.enableAllKeys();
+      const res = await api.enableAllKeys();
       if (!isCurrentCommand(rev)) return;
-      set({ disabledKeys: keys, catLock: false, error: null });
+      get().applyNativeEvent(
+        { disabledKeys: res.keys, catLock: false, error: null },
+        res.safetyEpoch,
+        res.runtimeRevision,
+      );
     } catch (err) {
       if (!isCurrentCommand(rev)) return;
       await fail(err);
@@ -203,9 +272,13 @@ export const useAppStore = create<AppStore>((set, get) => {
     const next = !get().catLock;
     set({ catLock: next });
     try {
-      const locked = await api.setCatLock(next);
+      const res = await api.setCatLock(next);
       if (!isCurrentCommand(rev)) return;
-      set({ catLock: locked, error: null });
+      get().applyNativeEvent(
+        { catLock: res.locked, error: null },
+        res.safetyEpoch,
+        res.runtimeRevision,
+      );
     } catch (err) {
       if (!isCurrentCommand(rev)) return;
       set({ catLock: !next });
@@ -231,7 +304,10 @@ export const useAppStore = create<AppStore>((set, get) => {
       await api.selectProfile(id);
       const snapshot = await api.getAppState();
       if (!isCurrentCommand(rev)) return;
-      set(apply(snapshot));
+      // P3: the post-command pull is stamped; drop it if newer state
+      // (event/snapshot) was applied while awaiting.
+      const next = apply(snapshot);
+      if (next) set(next);
     } catch (err) {
       if (!isCurrentCommand(rev)) return;
       await fail(err);
@@ -244,7 +320,10 @@ export const useAppStore = create<AppStore>((set, get) => {
       await api.createProfile(name);
       const snapshot = await api.getAppState();
       if (!isCurrentCommand(rev)) return;
-      set(apply(snapshot));
+      // P3: the post-command pull is stamped; drop it if newer state
+      // (event/snapshot) was applied while awaiting.
+      const next = apply(snapshot);
+      if (next) set(next);
     } catch (err) {
       if (!isCurrentCommand(rev)) return;
       await fail(err);
@@ -257,7 +336,10 @@ export const useAppStore = create<AppStore>((set, get) => {
       await api.duplicateProfile(get().profileId);
       const snapshot = await api.getAppState();
       if (!isCurrentCommand(rev)) return;
-      set(apply(snapshot));
+      // P3: the post-command pull is stamped; drop it if newer state
+      // (event/snapshot) was applied while awaiting.
+      const next = apply(snapshot);
+      if (next) set(next);
     } catch (err) {
       if (!isCurrentCommand(rev)) return;
       await fail(err);
@@ -270,7 +352,10 @@ export const useAppStore = create<AppStore>((set, get) => {
       await api.renameProfile(get().profileId, name);
       const snapshot = await api.getAppState();
       if (!isCurrentCommand(rev)) return;
-      set(apply(snapshot));
+      // P3: the post-command pull is stamped; drop it if newer state
+      // (event/snapshot) was applied while awaiting.
+      const next = apply(snapshot);
+      if (next) set(next);
     } catch (err) {
       if (!isCurrentCommand(rev)) return;
       await fail(err);
@@ -283,7 +368,10 @@ export const useAppStore = create<AppStore>((set, get) => {
       await api.deleteProfile(id);
       const snapshot = await api.getAppState();
       if (!isCurrentCommand(rev)) return;
-      set(apply(snapshot));
+      // P3: the post-command pull is stamped; drop it if newer state
+      // (event/snapshot) was applied while awaiting.
+      const next = apply(snapshot);
+      if (next) set(next);
     } catch (err) {
       if (!isCurrentCommand(rev)) return;
       await fail(err);
@@ -296,7 +384,10 @@ export const useAppStore = create<AppStore>((set, get) => {
       await api.resetProfile(get().profileId);
       const snapshot = await api.getAppState();
       if (!isCurrentCommand(rev)) return;
-      set(apply(snapshot));
+      // P3: the post-command pull is stamped; drop it if newer state
+      // (event/snapshot) was applied while awaiting.
+      const next = apply(snapshot);
+      if (next) set(next);
     } catch (err) {
       if (!isCurrentCommand(rev)) return;
       await fail(err);
@@ -310,7 +401,10 @@ export const useAppStore = create<AppStore>((set, get) => {
       await api.setOnboarded(true);
       const snapshot = await api.getAppState();
       if (!isCurrentCommand(rev)) return;
-      set(apply(snapshot));
+      // P3: the post-command pull is stamped; drop it if newer state
+      // (event/snapshot) was applied while awaiting.
+      const next = apply(snapshot);
+      if (next) set(next);
     } catch (err) {
       if (!isCurrentCommand(rev)) return;
       await fail(err);
@@ -374,14 +468,26 @@ export const useAppStore = create<AppStore>((set, get) => {
       await api.retryPersist();
       const snapshot = await api.getAppState();
       if (!isCurrentCommand(rev)) return;
-      set(apply(snapshot));
+      // P3: the post-command pull is stamped; drop it if newer state
+      // (event/snapshot) was applied while awaiting.
+      const next = apply(snapshot);
+      if (next) set(next);
     } catch (err) {
       if (!isCurrentCommand(rev)) return;
       await fail(err);
     }
   },
 
-  notePress: (code, down) => {
+  notePress: (code, down, seq) => {
+    // P3: native key events carry the engine's sequence. A stale or
+    // duplicate event (seq not newer than the last one seen for this key)
+    // is ignored so event reordering can never resurrect a released key.
+    // Window DOM listeners pass no seq and stay unordered.
+    if (seq !== undefined) {
+      const last = keyPressSeq.get(code) ?? -1;
+      if (seq <= last) return;
+      keyPressSeq.set(code, seq);
+    }
     const current = get().pressedKeys;
     if (down) {
       if (current.includes(code)) {
@@ -440,18 +546,32 @@ export const useAppStore = create<AppStore>((set, get) => {
   // HF-04: reconcile the displayed pressed keys with the native snapshot.
   // Used after window focus/visibility changes and emergency unlock, where
   // key-up events may have been missed while the UI was not watching.
+  // P3: the snapshot carries the sequence it was taken at. A key touched
+  // by a key event NEWER than the snapshot wins over the snapshot — the
+  // snapshot predates the event, so applying it blindly would drop a
+  // physically held key (order inversion).
   resyncPressed: async () => {
     try {
       const snap = await api.getPressedSnapshot();
       const native = new Set(snap.pressed);
       const current = get().pressedKeys;
-      const next = current.filter((c) => native.has(c));
-      for (const c of snap.pressed) {
-        if (!next.includes(c)) next.push(c);
-      }
-      for (const c of next) armStaleCheck(c);
+      const next: string[] = [];
       for (const c of current) {
-        if (!native.has(c)) disarmStaleCheck(c);
+        if ((keyPressSeq.get(c) ?? -1) > snap.sequence) {
+          if (!next.includes(c)) next.push(c);
+          continue;
+        }
+        if (native.has(c)) {
+          if (!next.includes(c)) next.push(c);
+        } else {
+          disarmStaleCheck(c);
+        }
+      }
+      for (const c of snap.pressed) {
+        if (!next.includes(c)) {
+          next.push(c);
+          armStaleCheck(c);
+        }
       }
       set({ pressedKeys: next, staleKeys: [] });
     } catch {
@@ -461,15 +581,21 @@ export const useAppStore = create<AppStore>((set, get) => {
 
   clearPressTracking: () => {
     for (const code of [...pressTimers.keys()]) disarmStaleCheck(code);
+    keyPressSeq.clear();
     set({ pressedKeys: [], staleKeys: [] });
   },
 
   clearEmergency: () => set({ emergencyNotice: false }),
-  showEmergency: () => {
+  showEmergency: (payload) => {
     // HF-05: an emergency invalidates every in-flight command response, so
     // a stale toggle/disable can never undo the unlock afterwards. This
     // mirrors the native discard_stale_command at the UI layer.
+    // P3: the event fires only after the epoch fully converged, so its
+    // (epoch, revision) is authoritative truth. Floor the ordering stamp
+    // on it: anything older (a late hydrate, a stale response) is dropped
+    // instead of overwriting the safe state.
     invalidateCommands();
+    markAppliedStamp(payload.epoch, payload.runtimeRevision);
     set({
       emergencyNotice: true,
       disabledKeys: [],

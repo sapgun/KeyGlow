@@ -24,9 +24,18 @@ pub fn show_main(app: &tauri::AppHandle) {
     }
 }
 
-fn emit_key(app: &tauri::AppHandle, event: &str, code: &str) {
+fn emit_key(app: &tauri::AppHandle, event: &str, code: &str, seq: u64) {
     static WARNED: AtomicBool = AtomicBool::new(false);
-    if let Err(err) = app.emit(event, code) {
+    // P3: the native event sequence travels with the key event so the UI
+    // can order key events against pressed-snapshot responses. Without it,
+    // a snapshot taken before a key-down but applied after would drop the
+    // physically held key from the display.
+    #[derive(serde::Serialize, Clone, Debug)]
+    struct KeyPressPayload<'a> {
+        code: &'a str,
+        seq: u64,
+    }
+    if let Err(err) = app.emit(event, KeyPressPayload { code, seq }) {
         if !WARNED.swap(true, Ordering::Relaxed) {
             tracing::error!("failed to emit {event} to UI: {err}");
         }
@@ -35,8 +44,8 @@ fn emit_key(app: &tauri::AppHandle, event: &str, code: &str) {
 
 fn dispatch_hook_event(app: &tauri::AppHandle, event: HookEvent) {
     match event {
-        HookEvent::KeyDown { code } => emit_key(app, "keyboard:key-down", code.as_str()),
-        HookEvent::KeyUp { code } => emit_key(app, "keyboard:key-up", code.as_str()),
+        HookEvent::KeyDown { code, seq } => emit_key(app, "keyboard:key-down", code.as_str(), seq),
+        HookEvent::KeyUp { code, seq } => emit_key(app, "keyboard:key-up", code.as_str(), seq),
         HookEvent::EmergencyUnlock { epoch } => {
             if let Some(state) = app.try_state::<AppState>() {
                 // Fallback path: converges only if the safety worker hasn't,
@@ -65,10 +74,36 @@ fn dispatch_hook_event(app: &tauri::AppHandle, event: HookEvent) {
 /// Converge UI + tray to the post-emergency safe state. Idempotent: safe to
 /// call from the worker, the event pump, or a stale-command path.
 pub(crate) fn emit_safety_converged(app: &tauri::AppHandle) {
+    use crate::commands::keyboard::{CatLockPayload, EmergencyPayload, StateChangedPayload};
     if let Some(state) = app.try_state::<AppState>() {
-        let _ = app.emit("keyboard:emergency-unlock", ());
-        let _ = app.emit("keyboard:state-changed", state.snapshot_disabled());
-        let _ = app.emit("keyboard:cat-lock", false);
+        // P3: every payload carries the ordering stamp. The emergency event
+        // fires only after complete_reconcile, so its (epoch, revision) is
+        // authoritative truth the UI can floor on: anything older is stale.
+        let epoch = state.safety.epoch();
+        let runtime_revision = state.runtime_revision.load(Ordering::SeqCst);
+        let _ = app.emit(
+            "keyboard:emergency-unlock",
+            EmergencyPayload {
+                epoch,
+                runtime_revision,
+            },
+        );
+        let _ = app.emit(
+            "keyboard:state-changed",
+            StateChangedPayload {
+                keys: state.snapshot_disabled(),
+                safety_epoch: epoch,
+                runtime_revision,
+            },
+        );
+        let _ = app.emit(
+            "keyboard:cat-lock",
+            CatLockPayload {
+                locked: false,
+                safety_epoch: epoch,
+                runtime_revision,
+            },
+        );
         let _ = app.emit("profile:changed", state.config.lock().clone());
         tray::refresh(app);
         tracing::warn!("emergency unlock converged (Default profile, all keys enabled)");
@@ -262,6 +297,7 @@ pub fn run() {
                 persisted_revision: AtomicU64::new(0),
                 persist_error: parking_lot::Mutex::new(None),
                 persist_error_kind: parking_lot::Mutex::new(None),
+                runtime_revision: AtomicU64::new(0),
             });
 
             spawn_event_pump(app.handle().clone(), backend.events);
