@@ -43,6 +43,10 @@ export interface Profile {
   disabledKeys: string[];
   /** 1:1 key remapping rules for this profile (S8). */
   remappings: RemapRule[];
+  /** Macros for this profile (S9). */
+  macros: MacroDef[];
+  /** Layers for this profile (S9). */
+  layers: LayerDef[];
   builtin: boolean;
 }
 
@@ -50,6 +54,57 @@ export interface Profile {
 export interface RemapRule {
   from: string;
   to: string;
+}
+
+/** One step of a macro (S9): a key down or up, `delayMs` after the
+ * previous step. */
+export interface MacroStepDef {
+  key: string;
+  action: "down" | "up";
+  delayMs: number;
+}
+
+/** A macro (S9): `trigger` starts the timed step sequence; `cancelKey`
+ * (default Escape) stops it mid-run. */
+export interface MacroDef {
+  id: string;
+  name: string;
+  trigger: string;
+  cancelKey: string;
+  steps: MacroStepDef[];
+}
+
+/** How a layer's switch key behaves (S9). */
+export type LayerMode = "hold" | "toggle";
+
+/** A layer (S9): while active, its `disabledKeys` and `remappings`
+ * replace the profile's base keymap. */
+export interface LayerDef {
+  id: string;
+  name: string;
+  switchKey: string;
+  mode: LayerMode;
+  disabledKeys: string[];
+  remappings: RemapRule[];
+}
+
+/** One layer of a QMK/VIA import preview (S9). */
+export interface QmkLayerSummary {
+  index: number;
+  switchKey: string | null;
+  switchMode: string | null;
+  remapCount: number;
+  disabledCount: number;
+}
+
+/** What the QMK/VIA import dialog shows before applying (S9). */
+export interface QmkImportPreview {
+  keyboard: string | null;
+  keymap: string | null;
+  layout: string;
+  layers: QmkLayerSummary[];
+  baseRemapCount: number;
+  baseDisabledCount: number;
 }
 
 /** One app rule (S5): foreground exe -> profile. */
@@ -124,6 +179,8 @@ export interface AppSnapshot {  hookActive: boolean;
   appRules: AppRule[];
   /** Master switch for automatic profile switching (S5). */
   autoProfileEnabled: boolean;
+  /** Id of the currently active layer, if any (S9). */
+  activeLayerId: string | null;
 }
 
 /**

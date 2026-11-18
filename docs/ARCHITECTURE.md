@@ -567,3 +567,78 @@ Full decisions in `docs/ADR-REMAPPING.md`. Headlines:
   `to_vk_scan`/`identify_key` roundtrip over all 110 codes.
 - **Limits:** UIPI may keep injected keys from elevated apps;
   Win+L / Ctrl+Alt+Del are not remappable; no per-device remapping.
+
+## ADR: macros, layers, QMK/VIA (S9)
+
+Implemented (PR `codex/feature-s9-macro-layer-qmk-via`): `keyboard/macro_runner.rs`
+(pure virtual-clock state machine), `keyboard/engine.rs` (evaluation
+order, layer tables, tick), `profiles/qmk.rs` (QMK/VIA import/export),
+`profiles/models.rs` (validation + load-time revalidation),
+`commands/profiles.rs` (`save_macro` / `delete_macro` / `save_layer` /
+`delete_layer`), `commands/keyboard.rs` (QMK/VIA commands),
+`components/MacroPanel.tsx`, `components/LayerPanel.tsx`,
+`components/QmkImportDialog.tsx`. Full format details in
+`docs/QMK-VIA.md`. Headlines:
+
+- **Scope:** per-profile macros and layers; QMK keymap.json / VIA
+  JSON import/export of the base keymap and layers only. Macros are
+  never imported (QMK macros are C code, not JSON). Actual QMK
+  firmware flashing is out of scope: this is a Windows keyboard
+  control app, not a firmware tool.
+- **One key, one role:** a remap source/target, a macro trigger, a
+  macro cancel key, and a layer switch key never overlap — except a
+  remap target may be a macro cancel key (an injected Escape is just
+  Escape, it does not cancel). The cancel key works even when the
+  profile disables it.
+- **Macros:** steps are `{key, action: down|up, delayMs}` (delay is
+  the wait before that step). Caps: 64 steps, 5000 ms per step,
+  30,000 ms per run, 16 macros per profile. A second trigger during
+  a run is consumed and ignored; other physical keys keep working
+  (interleaving allowed). Cancel key or emergency stops the run
+  immediately and releases held step keys in reverse order. The
+  same release happens on app exit, profile switch, and Cat Lock
+  on. Macro output is injected input, so it never remaps (S8) — but
+  it still passes the injected-lane disable / Cat Lock checks, so a
+  disabled step key is dropped at the hook.
+- **Clock and tick:** one shared monotonic clock
+  (`engine::macro_now_ms`, process-start `Instant`) for the hook and
+  the tick thread. The tick thread (`keyglow-macro`, 25 ms polling)
+  calls `macro_tick_execute` with the engine lock held, so tick and
+  `SendInput` are atomic (same pattern as the S8 callback).
+- **Layers:** the base keymap is the profile's own disabled/remap
+  table. Activating a layer replaces the current table with the
+  layer's; deactivating restores the base. Hold mode activates on
+  switch down and deactivates on up; toggle mode toggles on switch
+  down and consumes the up. The switch key itself is consumed.
+  Layer switches flush held keys first (S8 rule) and never cancel a
+  running macro. A layer remap source works even if the base
+  disables it (QMK meaning: the layer replaces the base keymap at
+  that position) — so layer validation only rejects disabled
+  *targets*. Editing rules while a layer is active resets to the
+  base. The active layer id is in `AppSnapshot.activeLayerId` and
+  shown in the UI.
+- **QMK/VIA:** keymap.json `{"keyboard", "keymap", "layout",
+  "layers": [[...]]}`; `XXXXXXX` = `KC_NO`, `_______` = `KC_TRNS`
+  (inherited from the layer below; nothing at layer 0). Import
+  replaces the profile's base keymap (from layer 0) and layers;
+  macros are untouched. `KC_MO(n)` / `KC_TG(n)` become the layer's
+  switch key (hold/toggle); a layer above 0 without a switch key,
+  a switch key that only appears inside its own layer, `MO(0)` /
+  `TG(0)`, and two different switch keys on one layer are all
+  rejected. Unsupported (rejected with a reason): `TO` / `DF` /
+  `OSL` / `LT` / `LM` / `TT` / `MT` / mod-tap and other compound
+  keycodes, QMK macros, unknown `KC_*`. VIA: hex keycodes for basic
+  keys only (`0x04`–`0xE7`); 16-bit layer keycodes are rejected
+  (their values vary by QMK version). VIA export is refused for
+  profiles with layers. The frontend never holds a KC table: the
+  backend validates and previews.
+- **Contracts kept:** P2 safety untouched; P3 `runtime_revision`
+  bumps once per macro/layer change (held state excluded from the
+  snapshot); P4 hook lifecycle untouched; S5 profile scope; S6
+  layouts are display only. `hook.rs` / `safety.rs` /
+  `hook_lifecycle.rs` changed only for the shared clock and the
+  macro-cancel-on-shutdown path — see the S9 report for the diff.
+- **Limits:** macro timing is 25 ms polling, not sample-accurate;
+  a macro step key that the profile disables is dropped at the
+  hook (not at validation time for the cancel path); UIPI applies
+  to macro injection the same as to remap injection (S8).

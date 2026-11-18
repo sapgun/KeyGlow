@@ -6,6 +6,8 @@ import type {
   AutoSwitchedPayload,
   EmergencyPayload,
   KeyboardLayout,
+  LayerDef,
+  MacroDef,
   MatchReason,
   Profile,
   RemapRule,
@@ -91,6 +93,8 @@ interface AppStore {
   appRules: AppRule[];
   /** S5: master switch for automatic profile switching. */
   autoProfileEnabled: boolean;
+  /** S9: id of the currently active layer, if any. */
+  activeLayerId: string | null;
   hydrate: () => Promise<void>;
   applySnapshot: (snapshot: AppSnapshot) => void;
   /**
@@ -137,6 +141,23 @@ interface AppStore {
   saveRemapRule: (rule: RemapRule) => Promise<void>;
   /** S8: delete one remap rule (by source key) from the current profile. */
   removeRemapRule: (from: string) => Promise<void>;
+  /** S9: create or replace one macro on the current profile. */
+  saveMacro: (macroDef: MacroDef) => Promise<void>;
+  /** S9: delete one macro (by id) from the current profile. */
+  removeMacro: (macroId: string) => Promise<void>;
+  /** S9: create or replace one layer on the current profile. */
+  saveLayer: (layer: LayerDef) => Promise<void>;
+  /** S9: delete one layer (by id) from the current profile. */
+  removeLayer: (layerId: string) => Promise<void>;
+  /** S9: import a QMK keymap into the current profile (replaces its
+   * base keymap and layers). */
+  importQmkKeymap: (json: string, layoutId: string, keyOrder: string[]) => Promise<void>;
+  /** S9: import a VIA keymap into the current profile. */
+  importViaKeymap: (json: string, layoutId: string, keyOrder: string[]) => Promise<void>;
+  /** S9: export the current profile as a QMK keymap.json string. */
+  exportQmkKeymap: (layoutId: string, keyOrder: string[]) => Promise<string>;
+  /** S9: export the current profile as a VIA JSON string. */
+  exportViaKeymap: (layoutId: string, keyOrder: string[]) => Promise<string>;
   /** S5: master switch for automatic profile switching. */
   setAutoProfileEnabled: (enabled: boolean) => Promise<void>;
   /** S5: clear the manual override and the safety pause, re-evaluating
@@ -191,6 +212,7 @@ function apply(snapshot: AppSnapshot): Partial<AppStore> | null {
     activeExe: snapshot.activeExe,
     appRules: snapshot.appRules,
     autoProfileEnabled: snapshot.autoProfileEnabled,
+    activeLayerId: snapshot.activeLayerId ?? null,
   };
 }
 
@@ -274,6 +296,7 @@ export const useAppStore = create<AppStore>((set, get) => {
   activeExe: null,
   appRules: [],
   autoProfileEnabled: true,
+  activeLayerId: null,
 
   applySnapshot: (snapshot) => {
     const next = apply(snapshot);
@@ -572,7 +595,9 @@ export const useAppStore = create<AppStore>((set, get) => {
   saveRemapRule: async (rule) => {
     const rev = beginCommand();
     try {
-      await api.saveRemapRule(rule);
+      // S9 fix: the backend needs the profile id (the earlier client
+      // sent { rule } and the invoke always failed on a real backend).
+      await api.saveRemapRule(get().profileId, rule);
       const snapshot = await api.getAppState();
       if (!isCurrentCommand(rev)) return;
       const next = apply(snapshot);
@@ -586,7 +611,7 @@ export const useAppStore = create<AppStore>((set, get) => {
   removeRemapRule: async (from) => {
     const rev = beginCommand();
     try {
-      await api.deleteRemapRule(from);
+      await api.deleteRemapRule(get().profileId, from);
       const snapshot = await api.getAppState();
       if (!isCurrentCommand(rev)) return;
       const next = apply(snapshot);
@@ -595,6 +620,98 @@ export const useAppStore = create<AppStore>((set, get) => {
       if (!isCurrentCommand(rev)) return;
       await fail(err);
     }
+  },
+
+  saveMacro: async (macroDef) => {
+    const rev = beginCommand();
+    try {
+      await api.saveMacro(get().profileId, macroDef);
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
+      const next = apply(snapshot);
+      if (next) set(next);
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      await fail(err);
+    }
+  },
+
+  removeMacro: async (macroId) => {
+    const rev = beginCommand();
+    try {
+      await api.deleteMacro(get().profileId, macroId);
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
+      const next = apply(snapshot);
+      if (next) set(next);
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      await fail(err);
+    }
+  },
+
+  saveLayer: async (layer) => {
+    const rev = beginCommand();
+    try {
+      await api.saveLayer(get().profileId, layer);
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
+      const next = apply(snapshot);
+      if (next) set(next);
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      await fail(err);
+    }
+  },
+
+  removeLayer: async (layerId) => {
+    const rev = beginCommand();
+    try {
+      await api.deleteLayer(get().profileId, layerId);
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
+      const next = apply(snapshot);
+      if (next) set(next);
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      await fail(err);
+    }
+  },
+
+  importQmkKeymap: async (json, layoutId, keyOrder) => {
+    const rev = beginCommand();
+    try {
+      await api.importQmkKeymap(get().profileId, json, layoutId, keyOrder);
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
+      const next = apply(snapshot);
+      if (next) set(next);
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      await fail(err);
+    }
+  },
+
+  importViaKeymap: async (json, layoutId, keyOrder) => {
+    const rev = beginCommand();
+    try {
+      await api.importViaKeymap(get().profileId, json, layoutId, keyOrder);
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
+      const next = apply(snapshot);
+      if (next) set(next);
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      await fail(err);
+    }
+  },
+
+  exportQmkKeymap: async (layoutId, keyOrder) => {
+    return api.exportQmkKeymap(get().profileId, layoutId, keyOrder);
+  },
+
+  exportViaKeymap: async (layoutId, keyOrder) => {
+    return api.exportViaKeymap(get().profileId, layoutId, keyOrder);
   },
 
   setAutoProfileEnabled: async (enabled) => {

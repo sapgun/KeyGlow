@@ -3,6 +3,7 @@ use crate::keyboard::{KeyCode, SafetyState};
 use crate::profiles::app_profiles::{
     AppProfileRuntime, AppRule, EffectiveChange, MatchReason,
 };
+use crate::profiles::models::{LayerDef, MacroDef};
 use crate::profiles::{save, AppConfig, DEFAULT_PROFILE_ID};
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -110,19 +111,17 @@ impl AppState {
     }
 
     pub fn apply_current_profile(&self) {
-        let cfg = self.config.lock();
-        let keys = cfg
-            .current_profile()
-            .map(|p| parse_key_ids(&p.disabled_keys))
-            .unwrap_or_default();
-        let rules = cfg
-            .current_profile()
-            .map(|p| parse_remap_rules(&p.remappings))
-            .unwrap_or_default();
-        drop(cfg);
-        self.controller.set_disabled_keys(&keys);
+        let (id, keys) = {
+            let cfg = self.config.lock();
+            let id = cfg.selected_profile.clone();
+            let keys = cfg
+                .current_profile()
+                .map(|p| parse_key_ids(&p.disabled_keys))
+                .unwrap_or_default();
+            (id, keys)
+        };
+        self.apply_profile_keys(&id);
         debug_assert!(keys.iter().all(|key| !self.controller.is_enabled(*key)));
-        self.apply_remap_rules(&rules);
     }
 
     pub fn snapshot_disabled(&self) -> Vec<String> {
@@ -169,8 +168,10 @@ impl AppState {
         }
         // S8: after the emergency the effective profile is Default, so
         // Default's rules apply (the pre-emergency profile's rules return
-        // only on explicit resume, exactly like its disabled keys).
-        self.apply_profile_rules(DEFAULT_PROFILE_ID);
+        // only on explicit resume, exactly like its disabled keys). S9:
+        // Default's macros and layers apply too — the engine must not
+        // keep the pre-emergency profile's definitions.
+        self.apply_profile_keys(DEFAULT_PROFILE_ID);
         // S5: the emergency pauses automation and drops any manual
         // override. The effective profile becomes Default with the
         // safety-paused reason; no auto-switch can undo the unlock until
@@ -259,16 +260,53 @@ impl AppState {
     /// Apply one profile's disabled keys to the controller. Runtime-only:
     /// no config write, no disk write.
     fn apply_profile_keys(&self, profile_id: &str) {
-        let keys = {
+        let (keys, macros, layers) = {
             let cfg = self.config.lock();
-            cfg.profile(profile_id)
-                .map(|p| parse_key_ids(&p.disabled_keys))
-                .unwrap_or_default()
+            let profile = cfg.profile(profile_id);
+            (
+                profile
+                    .map(|p| parse_key_ids(&p.disabled_keys))
+                    .unwrap_or_default(),
+                profile.map(|p| p.macros.clone()).unwrap_or_default(),
+                profile.map(|p| p.layers.clone()).unwrap_or_default(),
+            )
         };
-        self.controller.set_disabled_keys(&keys);
+        let flushed = self.controller.set_disabled_keys(&keys);
+        if !flushed.is_empty() {
+            if let Err(err) = crate::keyboard::inject::execute_injections(&flushed) {
+                tracing::error!("disabled-keys flush failed ({err}); a remapped key may stick");
+            }
+        }
         // S8: the same switch applies the profile's remap rules (flush
         // old held targets first, then install the new set).
         self.apply_profile_rules(profile_id);
+        // S9: and its macros and layers (a running macro is cancelled,
+        // an active layer deactivated, before the new definitions
+        // install).
+        self.apply_macros(&macros);
+        self.apply_layers(&layers);
+    }
+
+    /// S9: install a profile's macros on the controller (a running macro
+    /// is cancelled first) and execute the releases.
+    fn apply_macros(&self, defs: &[MacroDef]) {
+        let flushed = self.controller.set_macros(defs);
+        if !flushed.is_empty() {
+            if let Err(err) = crate::keyboard::inject::execute_injections(&flushed) {
+                tracing::error!("macro cancel failed ({err}); a macro key may stick");
+            }
+        }
+    }
+
+    /// S9: install a profile's layers on the controller (an active layer
+    /// is deactivated first) and execute the flush.
+    fn apply_layers(&self, defs: &[LayerDef]) {
+        let flushed = self.controller.set_layers(defs);
+        if !flushed.is_empty() {
+            if let Err(err) = crate::keyboard::inject::execute_injections(&flushed) {
+                tracing::error!("layer switch flush failed ({err}); a remapped key may stick");
+            }
+        }
     }
 
     /// Apply the current effective profile's keys (after a manual
@@ -282,6 +320,28 @@ impl AppState {
     pub fn apply_effective_profile_rules(&self) {
         let id = self.effective_profile_id();
         self.apply_profile_rules(&id);
+    }
+
+    /// S9: re-apply the effective profile's macros (a running macro is
+    /// cancelled first). Used by macro CRUD; does not touch layers.
+    pub fn apply_effective_profile_macros(&self) {
+        let id = self.effective_profile_id();
+        let defs = {
+            let cfg = self.config.lock();
+            cfg.profile(&id).map(|p| p.macros.clone()).unwrap_or_default()
+        };
+        self.apply_macros(&defs);
+    }
+
+    /// S9: re-apply the effective profile's layers (an active layer is
+    /// deactivated first). Used by layer CRUD.
+    pub fn apply_effective_profile_layers(&self) {
+        let id = self.effective_profile_id();
+        let defs = {
+            let cfg = self.config.lock();
+            cfg.profile(&id).map(|p| p.layers.clone()).unwrap_or_default()
+        };
+        self.apply_layers(&defs);
     }
 
     /// Record a manual profile selection in the runtime: it outranks app
@@ -405,8 +465,8 @@ mod tests {
         fn is_enabled(&self, key: KeyCode) -> bool {
             self.engine.lock().is_enabled(key)
         }
-        fn set_disabled_keys(&self, keys: &[KeyCode]) {
-            self.engine.lock().set_disabled_keys(keys);
+        fn set_disabled_keys(&self, keys: &[KeyCode]) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().set_disabled_keys(keys)
         }
         fn disabled_keys(&self) -> Vec<KeyCode> {
             self.engine.lock().disabled_keys()
@@ -431,6 +491,25 @@ mod tests {
         }
         fn flush_remaps(&self) -> Vec<crate::keyboard::InjectAction> {
             self.engine.lock().flush_remaps()
+        }
+        fn set_macros(&self, defs: &[MacroDef]) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().set_macros(defs)
+        }
+        fn set_layers(&self, defs: &[LayerDef]) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().set_layers(defs)
+        }
+        fn macro_tick_execute(&self, now_ms: u64) -> (bool, Option<u64>) {
+            // Tests never inject for real: advance the runner and
+            // discard the steps. Production controllers execute them.
+            let mut engine = self.engine.lock();
+            let _ = engine.macro_tick(now_ms);
+            (engine.macro_running(), engine.macro_next_due_ms())
+        }
+        fn active_layer_id(&self) -> Option<String> {
+            self.engine.lock().active_layer_id()
+        }
+        fn cancel_macro(&self) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().macro_cancel()
         }
     }
 
@@ -889,7 +968,7 @@ mod tests {
         let result = controller
             .engine
             .lock()
-            .process(KeyCode::KeyA, KeyPhase::Down);
+            .process(KeyCode::KeyA, KeyPhase::Down, 0);
         assert_eq!(result.inject, vec![InjectAction::Down(KeyCode::KeyB)]);
         // Switch to Default (no rules) mid-hold: the held target is
         // flushed (execute_injections is a stub off Windows, but the
@@ -905,13 +984,13 @@ mod tests {
         let release = controller
             .engine
             .lock()
-            .process(KeyCode::KeyA, KeyPhase::Up);
+            .process(KeyCode::KeyA, KeyPhase::Up, 0);
         assert!(release.inject.is_empty());
         // The next A press forwards normally.
         let again = controller
             .engine
             .lock()
-            .process(KeyCode::KeyA, KeyPhase::Down);
+            .process(KeyCode::KeyA, KeyPhase::Down, 0);
         assert_eq!(again.decision, HookDecision::Forward);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -950,7 +1029,7 @@ mod tests {
         let held = controller
             .engine
             .lock()
-            .process(KeyCode::KeyA, KeyPhase::Down);
+            .process(KeyCode::KeyA, KeyPhase::Down, 0);
         assert_eq!(held.inject, vec![InjectAction::Down(KeyCode::KeyB)]);
         // Emergency: held target flushed, Default's rules installed.
         state.emergency_unlock();
@@ -964,13 +1043,193 @@ mod tests {
         let release = controller
             .engine
             .lock()
-            .process(KeyCode::KeyA, KeyPhase::Up);
+            .process(KeyCode::KeyA, KeyPhase::Up, 0);
         assert!(release.inject.is_empty());
         let remapped = controller
             .engine
             .lock()
-            .process(KeyCode::KeyC, KeyPhase::Down);
+            .process(KeyCode::KeyC, KeyPhase::Down, 0);
         assert_eq!(remapped.inject, vec![InjectAction::Down(KeyCode::KeyD)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- S9: profile switches install macros/layers ----------------------
+
+    fn set_profile_macros(state: &AppState, profile_id: &str, macros: Vec<MacroDef>) {
+        state
+            .config
+            .lock()
+            .profile_mut(profile_id)
+            .unwrap()
+            .macros = macros;
+    }
+
+    fn set_profile_layers(state: &AppState, profile_id: &str, layers: Vec<LayerDef>) {
+        state
+            .config
+            .lock()
+            .profile_mut(profile_id)
+            .unwrap()
+            .layers = layers;
+    }
+
+    fn test_macro() -> MacroDef {
+        // The second step is delayed, so the run is still in progress
+        // right after the trigger — the switch/emergency tests can
+        // observe the cancellation.
+        MacroDef {
+            id: "m1".into(),
+            name: "Copy".into(),
+            trigger: "F9".into(),
+            cancel_key: "Escape".into(),
+            steps: vec![
+                crate::profiles::MacroStepDef {
+                    key: "ControlLeft".into(),
+                    action: "down".into(),
+                    delay_ms: 0,
+                },
+                crate::profiles::MacroStepDef {
+                    key: "KeyC".into(),
+                    action: "down".into(),
+                    delay_ms: 1000,
+                },
+                crate::profiles::MacroStepDef {
+                    key: "KeyC".into(),
+                    action: "up".into(),
+                    delay_ms: 0,
+                },
+                crate::profiles::MacroStepDef {
+                    key: "ControlLeft".into(),
+                    action: "up".into(),
+                    delay_ms: 0,
+                },
+            ],
+        }
+    }
+
+    fn test_layer() -> LayerDef {
+        LayerDef {
+            id: "l1".into(),
+            name: "Fn".into(),
+            switch_key: "CapsLock".into(),
+            mode: crate::profiles::LayerMode::Hold,
+            disabled_keys: vec![],
+            remappings: vec![],
+        }
+    }
+
+    #[test]
+    fn profile_switch_installs_macros_and_layers() {
+        let dir = unique_temp_path("s9_switch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (state, controller) = test_state_with_controller(dir.join("settings.json"));
+        set_profile_macros(&state, "gaming", vec![test_macro()]);
+        set_profile_layers(&state, "gaming", vec![test_layer()]);
+        {
+            let mut cfg = state.config.lock();
+            cfg.activate_profile("gaming").unwrap();
+        }
+        state.apply_current_profile();
+        // The gaming macro starts on F9 and is still running (its
+        // second step is delayed).
+        let started = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Down, 0);
+        assert_eq!(started.decision, HookDecision::Consume);
+        assert_eq!(
+            started.inject,
+            vec![InjectAction::Down(KeyCode::ControlLeft)]
+        );
+        assert!(controller.engine.lock().macro_running());
+        let _ = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Up, 0);
+        // The gaming layer switches on CapsLock.
+        let switched = controller
+            .engine
+            .lock()
+            .process(KeyCode::CapsLock, KeyPhase::Down, 0);
+        assert_eq!(switched.decision, HookDecision::Consume);
+        assert_eq!(
+            controller.engine.lock().active_layer_id(),
+            Some("l1".into())
+        );
+        // Switch to Default (no macros/layers): the run is cancelled and
+        // the layer deactivated, and the keys go back to normal.
+        {
+            let mut cfg = state.config.lock();
+            cfg.activate_profile(DEFAULT_PROFILE_ID).unwrap();
+        }
+        state.apply_current_profile();
+        assert!(!controller.engine.lock().macro_running());
+        assert_eq!(controller.engine.lock().active_layer_id(), None);
+        let f9 = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Down, 0);
+        assert_eq!(f9.decision, HookDecision::Forward);
+        let _ = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Up, 0);
+        // The switch key was still held across the profile switch; its
+        // release is consumed (its down was consumed too).
+        let caps_up = controller
+            .engine
+            .lock()
+            .process(KeyCode::CapsLock, KeyPhase::Up, 0);
+        assert_eq!(caps_up.decision, HookDecision::Consume);
+        let caps = controller
+            .engine
+            .lock()
+            .process(KeyCode::CapsLock, KeyPhase::Down, 0);
+        assert_eq!(caps.decision, HookDecision::Forward);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emergency_falls_back_to_default_macros_and_layers() {
+        let dir = unique_temp_path("s9_emergency");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (state, controller) = test_state_with_controller(dir.join("settings.json"));
+        set_profile_macros(&state, "gaming", vec![test_macro()]);
+        set_profile_layers(&state, "gaming", vec![test_layer()]);
+        {
+            let mut cfg = state.config.lock();
+            cfg.activate_profile("gaming").unwrap();
+        }
+        state.apply_current_profile();
+        // Start the gaming macro and activate the gaming layer.
+        let _ = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Down, 0);
+        let _ = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Up, 0);
+        let _ = controller
+            .engine
+            .lock()
+            .process(KeyCode::CapsLock, KeyPhase::Down, 0);
+        assert!(controller.engine.lock().macro_running());
+        assert_eq!(
+            controller.engine.lock().active_layer_id(),
+            Some("l1".into())
+        );
+        // Emergency: the macro is cancelled, the layer deactivated, and
+        // Default's (empty) definitions install — the gaming macro no
+        // longer starts.
+        state.emergency_unlock();
+        assert!(!controller.engine.lock().macro_running());
+        assert_eq!(controller.engine.lock().active_layer_id(), None);
+        let f9 = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Down, 0);
+        assert_eq!(f9.decision, HookDecision::Forward);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -259,6 +259,32 @@ fn spawn_hook_watcher(app: tauri::AppHandle, exit_rx: Receiver<HookExit>) {
         .expect("failed to start hook watcher thread");
 }
 
+/// S9: the macro tick thread. Polls the controller every 25ms when idle,
+/// and wakes at the next due step (at most 25ms out) while a run is in
+/// progress — so the first step of a run starts at most 25ms after its
+/// trigger press. The tick and its `SendInput` run atomically inside the
+/// controller (same lock discipline as the hook callback), so a cancel
+/// key cannot interleave a down after the run's up. A daemon thread: it
+/// ends with the process.
+fn spawn_macro_tick_thread(controller: Arc<dyn keyboard::engine::KeyboardController>) {
+    std::thread::Builder::new()
+        .name("keyglow-macro".into())
+        .spawn(move || loop {
+            let now_ms = keyboard::engine::macro_now_ms();
+            let (running, next_due) = controller.macro_tick_execute(now_ms);
+            let sleep_ms = if running {
+                next_due
+                    .map(|due| due.saturating_sub(now_ms).max(1))
+                    .unwrap_or(25)
+                    .min(25)
+            } else {
+                25
+            };
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+        })
+        .expect("failed to start macro tick thread");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -302,6 +328,16 @@ pub fn run() {
             delete_app_rule,
             save_remap_rule,
             delete_remap_rule,
+            save_macro,
+            delete_macro,
+            save_layer,
+            delete_layer,
+            validate_qmk_keymap,
+            import_qmk_keymap,
+            validate_via_keymap,
+            import_via_keymap,
+            export_qmk_keymap,
+            export_via_keymap,
             set_auto_profile_enabled,
             resume_auto_profile,
             get_app_profile_status,
@@ -332,6 +368,18 @@ pub fn run() {
                 .map(|p| crate::state::parse_remap_rules(&p.remappings))
                 .unwrap_or_default();
             let _ = backend.controller.set_remap_rules(&rules);
+            // S9: the current profile's macros and layers apply from
+            // startup too (no run is in progress, no layer is active).
+            let macros = config
+                .current_profile()
+                .map(|p| p.macros.clone())
+                .unwrap_or_default();
+            let _ = backend.controller.set_macros(&macros);
+            let layers = config
+                .current_profile()
+                .map(|p| p.layers.clone())
+                .unwrap_or_default();
+            let _ = backend.controller.set_layers(&layers);
 
             if backend.hook_active {
                 tracing::info!("keyboard control active");
@@ -343,6 +391,9 @@ pub fn run() {
             }
 
             let start_with_windows = config.start_with_windows;
+            // S9: the macro tick thread needs the controller after it
+            // moves into AppState.
+            let macro_controller = backend.controller.clone();
             app.manage(AppState {
                 controller: backend.controller,
                 config: parking_lot::Mutex::new(config),
@@ -369,6 +420,8 @@ pub fn run() {
                 backend.safety,
                 backend.safety_wake,
             );
+            // S9: the macro tick thread (daemon; ends with the process).
+            spawn_macro_tick_thread(macro_controller);
             if let Some(exit_rx) = backend.hook_exit {
                 spawn_hook_watcher(app.handle().clone(), exit_rx);
             }

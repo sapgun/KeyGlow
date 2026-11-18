@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 import { Keyboard } from "./components/Keyboard/Keyboard";
 import { AppRulesPanel } from "./components/AppRulesPanel";
 import { RemapPanel } from "./components/RemapPanel";
+import { MacroPanel } from "./components/MacroPanel";
+import { LayerPanel } from "./components/LayerPanel";
+import { QmkImportDialog } from "./components/QmkImportDialog";
 import { LayoutSelector } from "./components/LayoutSelector";
 import { LayoutImportDialog } from "./components/LayoutImportDialog";
 import { Onboarding } from "./components/Onboarding";
@@ -21,6 +24,7 @@ export default function App() {
   const layout = getLayout(store.layoutId);
   const profile = store.profiles.find((item) => item.id === store.profileId);
   const [importOpen, setImportOpen] = useState(false);
+  const [qmkOpen, setQmkOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -281,6 +285,21 @@ export default function App() {
           onDelete={store.removeRemapRule}
         />
 
+        <MacroPanel
+          macros={profile?.macros ?? []}
+          layout={layout}
+          onSave={store.saveMacro}
+          onDelete={store.removeMacro}
+        />
+
+        <LayerPanel
+          layers={profile?.layers ?? []}
+          activeLayerId={store.activeLayerId}
+          layout={layout}
+          onSave={store.saveLayer}
+          onDelete={store.removeLayer}
+        />
+
         <div className="mt-3 flex flex-shrink-0 flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-5 text-xs text-muted">
             <Legend swatch="enabled" label={t("legendOn")} />
@@ -289,6 +308,12 @@ export default function App() {
           </div>
           <div className="flex items-center gap-2">
             <CatLockButton locked={store.catLock} onToggle={() => void store.toggleCatLock()} />
+            <button
+              className="h-9 rounded-lg border border-border bg-panel-2 px-4 text-sm hover:border-lime/30"
+              onClick={() => setQmkOpen(true)}
+            >
+              {t("qmkOpen")}
+            </button>
             <label className="mr-3 flex items-center gap-2 text-xs text-muted">
               <input
                 type="checkbox"
@@ -320,6 +345,7 @@ export default function App() {
         disabledCount={store.disabledKeys.length}
       />
       {importOpen && <LayoutImportDialog onClose={() => setImportOpen(false)} />}
+      {qmkOpen && <QmkImportDialog layout={layout} onClose={() => setQmkOpen(false)} />}
     </div>
   );
 }

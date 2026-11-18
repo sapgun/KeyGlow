@@ -488,23 +488,36 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const profileWithoutRule = { ...profileWithRule, remappings: [] };
   let saved = null;
   __mockInvoke("save_remap_rule", (args) => {
-    saved = args.rule;
+    saved = args;
     return undefined;
   });
   __mockInvoke("get_app_state", () =>
     snap({ profiles: [profileWithRule], runtimeRevision: 7 }),
   );
   await useAppStore.getState().saveRemapRule(rule);
-  check("T11 save remap invokes backend", eq(saved, rule));
+  // S9 fix: the client sends (profile_id, from, to) — the earlier
+  // { rule } payload made the invoke fail on a real backend.
+  check(
+    "T11 save remap invokes backend with profile id and keys",
+    saved.profile_id === "default" && saved.from === "KeyA" && saved.to === "KeyB",
+  );
   check(
     "T11 save remap refreshes snapshot",
     eq(useAppStore.getState().profiles[0]?.remappings, [rule]),
   );
-  __mockInvoke("delete_remap_rule", () => undefined);
+  let deleted = null;
+  __mockInvoke("delete_remap_rule", (args) => {
+    deleted = args;
+    return undefined;
+  });
   __mockInvoke("get_app_state", () =>
     snap({ profiles: [profileWithoutRule], runtimeRevision: 8 }),
   );
   await useAppStore.getState().removeRemapRule("KeyA");
+  check(
+    "T11 delete remap invokes backend with profile id and key",
+    deleted.profile_id === "default" && deleted.from === "KeyA",
+  );
   check(
     "T11 delete remap refreshes snapshot",
     eq(useAppStore.getState().profiles[0]?.remappings, []),
@@ -525,6 +538,163 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   await p;
   check("T11 stale post-save snapshot dropped", eq(useAppStore.getState().profiles, [profileWithoutRule]));
   check("T11 emergency floor holds profile", useAppStore.getState().profileId === "default");
+}
+
+// ---------------------------------------------------------------- T12
+// S9: macro/layer CRUD and QMK import drive the real invoke layer with
+// (profile_id, ...) args and refresh the snapshot (profiles carry
+// macros/layers, snapshot carries activeLayerId). A pending save
+// invalidated by an emergency never pulls a stale snapshot afterwards.
+{
+  const useAppStore = await freshStore();
+  __resetInvoke();
+  const macro = {
+    id: "m1",
+    name: "Hello",
+    trigger: "F9",
+    cancelKey: "Escape",
+    steps: [
+      { key: "KeyH", action: "down", delayMs: 0 },
+      { key: "KeyH", action: "up", delayMs: 10 },
+    ],
+  };
+  const layer = {
+    id: "l1",
+    name: "FN",
+    switchKey: "CapsLock",
+    mode: "hold",
+    disabledKeys: ["KeyA"],
+    remappings: [{ from: "KeyB", to: "KeyC" }],
+  };
+  const profileFull = {
+    id: "default",
+    name: "Default",
+    layout: "tkl-ansi",
+    disabledKeys: [],
+    remappings: [],
+    macros: [macro],
+    layers: [layer],
+    builtin: true,
+  };
+  const profileBare = { ...profileFull, macros: [], layers: [] };
+
+  let savedMacro = null;
+  __mockInvoke("save_macro", (args) => {
+    savedMacro = args;
+    return undefined;
+  });
+  __mockInvoke("get_app_state", () =>
+    snap({ profiles: [profileFull], runtimeRevision: 20 }),
+  );
+  await useAppStore.getState().saveMacro(macro);
+  check(
+    "T12 save macro invokes backend with profile id and def",
+    savedMacro.profile_id === "default" && eq(savedMacro.macro_def, macro),
+  );
+  check(
+    "T12 save macro refreshes snapshot",
+    eq(useAppStore.getState().profiles[0]?.macros, [macro]),
+  );
+
+  let deletedMacro = null;
+  __mockInvoke("delete_macro", (args) => {
+    deletedMacro = args;
+    return undefined;
+  });
+  __mockInvoke("get_app_state", () =>
+    snap({ profiles: [profileBare], runtimeRevision: 21 }),
+  );
+  await useAppStore.getState().removeMacro("m1");
+  check(
+    "T12 delete macro invokes backend with profile id and id",
+    deletedMacro.profile_id === "default" && deletedMacro.macro_id === "m1",
+  );
+  check(
+    "T12 delete macro refreshes snapshot",
+    eq(useAppStore.getState().profiles[0]?.macros, []),
+  );
+
+  let savedLayer = null;
+  __mockInvoke("save_layer", (args) => {
+    savedLayer = args;
+    return undefined;
+  });
+  __mockInvoke("get_app_state", () =>
+    snap({ profiles: [profileFull], runtimeRevision: 22 }),
+  );
+  await useAppStore.getState().saveLayer(layer);
+  check(
+    "T12 save layer invokes backend with profile id and def",
+    savedLayer.profile_id === "default" && eq(savedLayer.layer, layer),
+  );
+  check(
+    "T12 save layer refreshes snapshot",
+    eq(useAppStore.getState().profiles[0]?.layers, [layer]),
+  );
+
+  let deletedLayer = null;
+  __mockInvoke("delete_layer", (args) => {
+    deletedLayer = args;
+    return undefined;
+  });
+  __mockInvoke("get_app_state", () =>
+    snap({ profiles: [profileBare], runtimeRevision: 23 }),
+  );
+  await useAppStore.getState().removeLayer("l1");
+  check(
+    "T12 delete layer invokes backend with profile id and id",
+    deletedLayer.profile_id === "default" && deletedLayer.layer_id === "l1",
+  );
+  check(
+    "T12 delete layer refreshes snapshot",
+    eq(useAppStore.getState().profiles[0]?.layers, []),
+  );
+
+  const qmkJson = JSON.stringify({
+    keyboard: "keyglow",
+    keymap: "default",
+    layout: "LAYOUT_all",
+    layers: [["KeyA", "KeyB"]],
+  });
+  let imported = null;
+  __mockInvoke("import_qmk_keymap", (args) => {
+    imported = args;
+    return undefined;
+  });
+  __mockInvoke("get_app_state", () =>
+    snap({ profiles: [profileFull], runtimeRevision: 24, activeLayerId: "l1" }),
+  );
+  await useAppStore.getState().importQmkKeymap(qmkJson, "tkl-ansi", ["KeyA", "KeyB"]);
+  check(
+    "T12 import qmk invokes backend with profile, json, layout, order",
+    imported.profile_id === "default" &&
+      imported.json === qmkJson &&
+      imported.layout_id === "tkl-ansi" &&
+      eq(imported.key_order, ["KeyA", "KeyB"]),
+  );
+  check(
+    "T12 import qmk refreshes snapshot",
+    eq(useAppStore.getState().profiles[0]?.layers, [layer]),
+  );
+  check(
+    "T12 snapshot carries active layer",
+    useAppStore.getState().activeLayerId === "l1",
+  );
+
+  // Emergency floors a pending macro save: the post-command snapshot
+  // pull still happens, but its result is dropped.
+  __resetInvoke();
+  const d = deferred();
+  __mockInvoke("save_macro", () => d.promise);
+  __mockInvoke("get_app_state", () =>
+    Promise.resolve(snap({ profiles: [], runtimeRevision: 1, activeLayerId: null })),
+  );
+  const p = useAppStore.getState().saveMacro(macro);
+  useAppStore.getState().showEmergency({ epoch: 6, runtimeRevision: 101 });
+  d.resolve(undefined);
+  await p;
+  check("T12 stale post-save snapshot dropped", eq(useAppStore.getState().profiles, [profileFull]));
+  check("T12 emergency floor holds profile", useAppStore.getState().profileId === "default");
 }
 
 console.log(`\n${passed} assertions passed`);

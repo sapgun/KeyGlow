@@ -563,3 +563,113 @@ Physical (needs the rig):
 16. Create `A → B` and `C → B`. Hold `A`, hold `C`, release `A`.
     Expected: `B` is still held (a held-`b` repeat or a test app
     shows it down). Release `C`. Expected: `B` is released.
+
+## Test 25 — Macros, layers, QMK/VIA (S9)
+
+Implemented (`keyboard/macro_runner.rs`, `keyboard/engine.rs`,
+`profiles/qmk.rs`, `profiles/models.rs`, `commands/profiles.rs`,
+`commands/keyboard.rs`, `MacroPanel.tsx`, `LayerPanel.tsx`,
+`QmkImportDialog.tsx`). Automated checks below are covered by the
+Rust engine tests (`macro_runner.rs`, `engine.rs`, `models.rs`,
+`qmk.rs`, `state.rs`) and the frontend contract (T12 in
+`scripts/test-store-contract.mjs`); they pass in the local harness —
+see the S9 report for the Windows CI result. Nothing physical is
+verified yet.
+
+Automated (engine unit tests, frontend contract T12; Windows CI):
+
+- Macro runner: start/tick/cancel, held keys released in reverse
+  order, second trigger during a run consumed and ignored, 30 s
+  run limit aborts, cancel key works while disabled.
+- Engine: macro start on trigger down, 0-delay leading steps run
+  immediately, other physical keys interleave during a run, cancel
+  and emergency flush held steps, profile switch installs the new
+  profile's macros and layers, Cat Lock on cancels a running macro.
+- Layers: hold activates on switch down and deactivates on up,
+  toggle toggles on switch down and consumes the up, switch key is
+  consumed, layer switch flushes held keys, rule edits reset to
+  the base, a layer remap source works even when the base disables
+  it (QMK meaning), disabled layer targets are rejected.
+- Validation: unbalanced steps, Pause step, toggle-key step,
+  disabled step key, role overlaps (remap source/target, macro
+  trigger, macro cancel, layer switch), caps (64 steps, 5000 ms
+  per step, 16 macros, 8 layers per profile).
+- QMK: base-only import, layer with MO + TRNS inheritance,
+  missing switch key, unreachable switch key, unsupported
+  compound keycode, layout mismatch, length mismatch, export
+  roundtrip; VIA basic keycodes and 16-bit layer code refusal;
+  VIA export refused for profiles with layers.
+- Frontend: macro/layer CRUD drives the real invoke layer with
+  (profile_id, ...) args and refreshes the snapshot; QMK import
+  sends profile, JSON, layout, and key order; the snapshot carries
+  the active layer id; a stale macro-save response is dropped by
+  the ordering gate; an emergency floors a pending macro save.
+  The S8 remap invoke fix (profile_id, from, to) is asserted in
+  T11.
+
+Physical (needs the rig):
+
+1. Create a macro triggered by `F9` with steps `H` down, `H` up
+   (delay 10 ms), name it "Hello". Focus Notepad, press `F9`.
+   Expected: `h` appears once. Press `F9` again. Expected: `h`
+   appears again. The macro is listed in the UI.
+2. Create a macro with a long delay (e.g. `A` down, 2000 ms,
+   `A` up). Press the trigger, then press `Escape` after 500 ms.
+   Expected: `a` stops — no further `a` appears after the cancel,
+   and no key is stuck (the next plain `A` types `a` once).
+3. With a macro running (long delay), press `Ctrl + Shift + F12`
+   with the other hand. Expected: the run stops immediately, no
+   stuck key, all keys are enabled afterwards.
+4. Create a macro triggered by `F9` with 70 steps (or one step
+   with a 6000 ms delay, or a total run over 30 s). Expected: the
+   save is refused with a message naming the limit (or, for a run
+   that exceeds the time limit, it aborts mid-run and the log
+   says so).
+5. Hold a macro step key down (the macro holds `A` for 5 s),
+   switch to another profile mid-run. Expected: the held `A` is
+   released (no stuck `a`), the new profile's macros are the ones
+   listed.
+6. Hold a macro step key down, choose tray **Exit** while holding.
+   Expected: the key is released cleanly (no stuck key after
+   exit). Repeat with a force-kill while holding, then restart.
+   Expected: the key is not stuck after restart (startup sweep).
+7. Create a layer switched by `CapsLock` (hold) that disables `A`
+   and remaps `B → C`. Hold `CapsLock`, press `A`. Expected:
+   nothing types. Press `B`. Expected: `c` appears. Release
+   `CapsLock`, press `A`. Expected: `a` appears again (base
+   restored). The active layer is shown in the UI while held.
+8. Create a layer switched by `F10` (toggle). Press `F10` once,
+   press `A` (disabled in the layer). Expected: nothing types.
+   Press `F10` again, press `A`. Expected: `a` appears.
+9. With a layer active, press its switch key's own position in a
+   text field. Expected: nothing types (the switch key is
+   consumed). Press the layer's remap target key directly.
+   Expected: it still types its own letter (no chaining).
+10. Create a layer whose remap source is a key the base profile
+    disables. Expected: the save is accepted, and while the layer
+    is active the remap works (layer replaces the base at that
+    position). Create a layer whose remap *target* is a key the
+    base disables. Expected: the save is refused.
+11. Try to use one key as both a macro trigger and a layer switch
+    key (or as a remap source). Expected: the second save is
+    refused with a message naming the conflict.
+12. Import the sample QMK keymap.json from `docs/QMK-VIA.md`
+    (layer 0 base + layer 1 with `MO(1)`). Expected: the preview
+    shows both layers with the switch key and counts; applying
+    replaces the base keymap and adds the layer; the profile's
+    macros are still listed. Cancel an import. Expected: the
+    profile is unchanged.
+13. Import a VIA JSON file with a 16-bit layer keycode.
+    Expected: refused with a reason pointing at QMK keymap.json.
+14. Export the profile as QMK, then import the exported file
+    into a fresh profile. Expected: the roundtrip reproduces the
+    same base keymap and layers. Export as VIA with a layered
+    profile. Expected: refused with a message pointing at QMK.
+15. Run a macro while its step key is disabled in the profile.
+    Expected: the step is dropped (nothing types for that step)
+    and the run continues or aborts cleanly — record which.
+    (Injected-lane disable check; see ARCHITECTURE.md S9.)
+16. Open an elevated (Run as administrator) Notepad, trigger a
+    macro. Expected: record whether the injected steps arrive.
+    If they do not, the physical trigger still works (UIPI — same
+    open question as S8). No admin prompt from KeyGlow itself.

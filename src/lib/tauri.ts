@@ -9,8 +9,11 @@ import type {
   EmergencyPayload,
   HookStatusPayload,
   KeyboardLayout,
+  LayerDef,
+  MacroDef,
   PressedSnapshot,
   Profile,
+  QmkImportPreview,
   RemapRule,
   StateChangedPayload,
 } from "../types/keyboard";
@@ -93,12 +96,125 @@ export function saveAppRule(rule: AppRule) {
 }
 
 // S8: remap rules (1:1, per profile). The backend validates and persists.
-export function saveRemapRule(rule: RemapRule) {
-  return invoke<void>("save_remap_rule", { rule });
+// S9 fix: the backend command takes (profile_id, from, to) — the earlier
+// client sent { rule } and the invoke always failed on a real backend.
+export function saveRemapRule(profileId: string, rule: RemapRule) {
+  return invoke<RemapRule>("save_remap_rule", {
+    profile_id: profileId,
+    from: rule.from,
+    to: rule.to,
+  });
 }
 
-export function deleteRemapRule(from: string) {
-  return invoke<void>("delete_remap_rule", { from });
+export function deleteRemapRule(profileId: string, from: string) {
+  return invoke<void>("delete_remap_rule", { profile_id: profileId, from });
+}
+
+// S9: macros (per profile). The backend validates (balanced steps, one
+// key one role) and persists; a running macro is cancelled on save.
+export function saveMacro(profileId: string, macroDef: MacroDef) {
+  return invoke<MacroDef>("save_macro", {
+    profile_id: profileId,
+    macro_def: macroDef,
+  });
+}
+
+export function deleteMacro(profileId: string, macroId: string) {
+  return invoke<void>("delete_macro", { profile_id: profileId, macro_id: macroId });
+}
+
+// S9: layers (per profile). The backend validates and persists; an
+// active layer is deactivated before the new definitions install.
+export function saveLayer(profileId: string, layer: LayerDef) {
+  return invoke<LayerDef>("save_layer", { profile_id: profileId, layer });
+}
+
+export function deleteLayer(profileId: string, layerId: string) {
+  return invoke<void>("delete_layer", { profile_id: profileId, layer_id: layerId });
+}
+
+// S9: QMK / VIA keymap import and export. `keyOrder` is the layout's
+// position order (row-major, (y, x) sorted) from the layout registry;
+// the backend never has to know a layout's geometry. Import replaces
+// the profile's base keymap and layers; macros are untouched.
+export function validateQmkKeymap(
+  profileId: string,
+  json: string,
+  layoutId: string,
+  keyOrder: string[],
+) {
+  return invoke<QmkImportPreview>("validate_qmk_keymap", {
+    profile_id: profileId,
+    json,
+    layout_id: layoutId,
+    key_order: keyOrder,
+  });
+}
+
+export function importQmkKeymap(
+  profileId: string,
+  json: string,
+  layoutId: string,
+  keyOrder: string[],
+) {
+  return invoke<StateChangedPayload>("import_qmk_keymap", {
+    profile_id: profileId,
+    json,
+    layout_id: layoutId,
+    key_order: keyOrder,
+  });
+}
+
+export function validateViaKeymap(
+  profileId: string,
+  json: string,
+  layoutId: string,
+  keyOrder: string[],
+) {
+  return invoke<QmkImportPreview>("validate_via_keymap", {
+    profile_id: profileId,
+    json,
+    layout_id: layoutId,
+    key_order: keyOrder,
+  });
+}
+
+export function importViaKeymap(
+  profileId: string,
+  json: string,
+  layoutId: string,
+  keyOrder: string[],
+) {
+  return invoke<StateChangedPayload>("import_via_keymap", {
+    profile_id: profileId,
+    json,
+    layout_id: layoutId,
+    key_order: keyOrder,
+  });
+}
+
+export function exportQmkKeymap(
+  profileId: string,
+  layoutId: string,
+  keyOrder: string[],
+  keyboard?: string,
+  keymap?: string,
+) {
+  return invoke<string>("export_qmk_keymap", {
+    profile_id: profileId,
+    layout_id: layoutId,
+    key_order: keyOrder,
+    keyboard: keyboard ?? null,
+    keymap: keymap ?? null,
+  });
+}
+
+export function exportViaKeymap(profileId: string, layoutId: string, keyOrder: string[]) {
+  return invoke<string>("export_via_keymap", {
+    profile_id: profileId,
+    layout_id: layoutId,
+    key_order: keyOrder,
+  });
 }
 
 export function deleteAppRule(id: string) {

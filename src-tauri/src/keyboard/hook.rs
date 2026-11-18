@@ -184,7 +184,12 @@ fn start_windows_hook() -> Result<HookStart, String> {
                     // sequence read here IS this event's sequence. No new
                     // blocking in the callback; the lock was already taken.
                     let mut engine = shared.engine.lock();
-                    let mut result = engine.process_event_injected(key, is_up, injected);
+                    let mut result = engine.process_event_injected(
+                        key,
+                        is_up,
+                        injected,
+                        crate::keyboard::engine::macro_now_ms(),
+                    );
                     let seq = engine.event_sequence();
                     // S8 (D3): execute injections synchronously, still
                     // inside the callback, and only then return the
