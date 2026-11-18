@@ -95,7 +95,57 @@ Stored as JSON. Layout and disabled-key set are separate fields. Built-in profil
 - Events: `sync_channel(1024)` + `try_send` (drops if the UI is stuck; input is never delayed). Key down/up pulses are lossy by design; the emergency signal is not — it rides the safety epoch latch.
 - Safety wake: unbounded `mpsc::channel::<()>`; `send` from the hook never blocks.
 - Persistence: only from command/event/safety-worker threads, never from the hook.
-- Convergence exactly-once: `SafetyState::claim_reconcile(epoch)` elects a single converger per epoch across the safety worker, the event pump fallback, and stale-command repair.
+- Convergence protocol (P2): `SafetyState` separates election from completion.
+  `claim_reconcile(epoch)` elects a converger (exactly once per epoch);
+  the actual work runs under `convergence_lock()` (blocking) or
+  `try_convergence_lock()` (never blocks; UI thread), and only then does
+  `complete_reconcile(epoch)` advance the truthful completion marker
+  (`reconciled_epoch()`). The worker loops on `pending_epoch()`, so an
+  epoch elected-but-never-worked is never silently lost, and convergence
+  work for different epochs never overlaps. See "ADR: safety convergence
+  claim/completion (P2)" below.
+
+## ADR: safety convergence claim/completion (P2)
+
+**Defect (reproduced):** `claim_reconcile` advanced the completion marker
+(`reconciled_epoch()`) before the config/controller work actually ran.
+Claim unit tests passing did not prove that different epochs' full
+convergence was serialized — and the worker's claim-then-skip pattern meant
+an epoch elected-but-never-worked could be silently lost.
+
+**Design:** `SafetyState` now carries three markers:
+
+- `epoch` — bumped by the hook (one atomic increment).
+- `claimed` — election marker, written by `claim_reconcile` (exactly-once).
+- `completed` — truthful completion marker, written only by
+  `complete_reconcile`, after the work, under the convergence lock.
+  Monotonic: a late straggler never moves it backwards.
+
+Plus `convergence: Mutex<()>` serializing the work across the safety
+worker, the event-pump fallback, and the stale-command path:
+
+- Worker (background thread): loops on `pending_epoch()`; takes the
+  blocking lock; re-checks; claims; runs `emergency_unlock()`; completes;
+  repeats if a newer epoch landed mid-work.
+- Pump fallback (UI thread): only if `reconciled_epoch() < epoch`, and only
+  via `try_convergence_lock()` — never blocks the UI. If the worker is
+  mid-convergence, the pump skips; the worker picks up the latest epoch.
+- Stale-command path (command pool): takes the blocking lock and forces
+  re-convergence, then completes.
+
+**Wake channel evaluation (P2):** the wake path is an unbounded
+`std::mpsc::Sender<()>`. It never blocks the hook (no capacity to wait on),
+but it is *not* allocation-free (one node allocation per `send`) and *not*
+lock-free (brief internal queue lock). The worker's `try_recv` drain
+coalesces rapid presses, so the queue stays ~empty at human press rates; a
+failed `send` (worker gone) is ignored because the epoch latch plus the pump
+fallback still converge. Measured on Linux (std mpsc, release): 2000 rapid
+`trigger()+send()` calls cost p50 90ns / p99 230ns / max 6.7us per call —
+negligible against the hook timeout, but the stress run also showed the
+queue reaching depth 938 when the worker is slow, proving it is *not*
+bounded. No change: the cost is negligible at human press rates and the
+hook already does more (engine lock, key identification). Do not claim
+allocation-free/lock-free/bounded.
 
 ## ADR: safe settings replace (HF-02)
 

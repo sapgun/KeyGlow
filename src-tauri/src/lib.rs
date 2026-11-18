@@ -39,12 +39,23 @@ fn dispatch_hook_event(app: &tauri::AppHandle, event: HookEvent) {
         HookEvent::KeyUp { code } => emit_key(app, "keyboard:key-up", code.as_str()),
         HookEvent::EmergencyUnlock { epoch } => {
             if let Some(state) = app.try_state::<AppState>() {
-                // Fallback path: normally the safety worker already claimed
-                // this epoch. If the worker is gone, a surviving queue event
-                // still converges the state exactly once.
-                if state.safety.claim_reconcile(epoch) {
-                    state.emergency_unlock();
-                    emit_safety_converged(app);
+                // Fallback path: converges only if the safety worker hasn't,
+                // and never blocks the UI thread. If the worker is already
+                // converging, it will pick up the latest epoch itself via
+                // pending_epoch(), so skipping here loses nothing.
+                if state.safety.reconciled_epoch() < epoch {
+                    if let Some(_work) = state.safety.try_convergence_lock() {
+                        // Re-check under the lock: the worker may have
+                        // finished while we were deciding.
+                        let target = state.safety.epoch();
+                        if state.safety.reconciled_epoch() < target {
+                            let _elected = state.safety.claim_reconcile(target);
+                            state.emergency_unlock();
+                            state.safety.complete_reconcile(target);
+                            drop(_work);
+                            emit_safety_converged(app);
+                        }
+                    }
                 }
             }
         }
@@ -68,13 +79,22 @@ pub(crate) fn emit_safety_converged(app: &tauri::AppHandle) {
 /// landed: its intent must not re-disable keys after the unlock.
 ///
 /// Convergence here is forced, not claim-based: the stale command's own
-/// mutations may have landed *after* the worker's exactly-once convergence,
-/// so the claim cannot be relied on to repair them. `emergency_unlock` is
-/// idempotent (controller enable-all, Default selection, cleared disable
-/// set, best-effort persist), and this path only runs on a genuine race,
-/// never once per press.
+/// mutations may have landed *after* the worker's convergence, so election
+/// alone cannot be relied on to repair them. The work is serialized with the
+/// worker/pump paths via the convergence lock (blocking is fine: command
+/// handlers run on a thread pool, never on the hook callback or UI thread),
+/// and the completion marker is advanced only after the work finished.
+/// `emergency_unlock` is idempotent (controller enable-all, Default
+/// selection, cleared disable set, best-effort persist), and this path only
+/// runs on a genuine race, never once per press.
 pub(crate) fn discard_stale_command(app: &tauri::AppHandle, state: &AppState, reason: &'static str) {
-    state.emergency_unlock();
+    {
+        let _work = state.safety.convergence_lock();
+        let target = state.safety.epoch();
+        let _elected = state.safety.claim_reconcile(target);
+        state.emergency_unlock();
+        state.safety.complete_reconcile(target);
+    }
     emit_safety_converged(app);
     tracing::warn!("command discarded after emergency unlock ({reason})");
 }
@@ -99,13 +119,22 @@ fn spawn_event_pump(app: tauri::AppHandle, rx: std::sync::mpsc::Receiver<HookEve
         .expect("failed to start event pump thread");
 }
 
-/// Safety worker for emergency unlock (HF-01).
+/// Safety worker for emergency unlock (HF-01, P2).
 ///
 /// The hook thread only bumps the safety epoch and wakes this worker over an
 /// unbounded channel, so a saturated UI event queue (or a delayed UI thread)
 /// can never lose the unlock: the epoch latch is authoritative and the worker
 /// converges config + controller + persist on its own thread. UI/tray events
 /// still go through the main thread, mirroring the event pump.
+///
+/// Convergence protocol (P2): the worker loops on `pending_epoch()` and, for
+/// each pending epoch, takes the convergence lock (blocking is fine here:
+/// this is a dedicated background thread, never the hook callback or the UI
+/// thread), re-checks under the lock, runs the idempotent
+/// `emergency_unlock()`, and only then advances the completion marker. A
+/// newer trigger landing mid-work is picked up by the next loop iteration,
+/// and convergence work never overlaps with the pump fallback or the
+/// stale-command path.
 fn spawn_safety_worker(
     app: tauri::AppHandle,
     safety: Arc<SafetyState>,
@@ -117,21 +146,38 @@ fn spawn_safety_worker(
             while wake.recv().is_ok() {
                 // Coalesce rapid repeated presses; the epoch decides the work.
                 while wake.try_recv().is_ok() {}
-                let epoch = safety.epoch();
                 let Some(state) = app.try_state::<AppState>() else {
                     continue;
                 };
-                if !safety.claim_reconcile(epoch) {
-                    continue;
+                let mut did_work = false;
+                loop {
+                    if safety.pending_epoch().is_none() {
+                        break;
+                    }
+                    {
+                        let _work = safety.convergence_lock();
+                        // Re-check under the lock: another path may have
+                        // converged while we were waiting for it.
+                        if safety.reconciled_epoch() >= safety.epoch() {
+                            break;
+                        }
+                        let target = safety.epoch();
+                        let _elected = safety.claim_reconcile(target);
+                        state.emergency_unlock();
+                        safety.complete_reconcile(target);
+                        did_work = true;
+                    }
+                    // Loop again: a newer epoch may have landed during the work.
                 }
-                state.emergency_unlock();
-                let handle = app.clone();
-                let posted = handle.clone();
-                if handle
-                    .run_on_main_thread(move || emit_safety_converged(&posted))
-                    .is_err()
-                {
-                    emit_safety_converged(&app);
+                if did_work {
+                    let handle = app.clone();
+                    let posted = handle.clone();
+                    if handle
+                        .run_on_main_thread(move || emit_safety_converged(&posted))
+                        .is_err()
+                    {
+                        emit_safety_converged(&app);
+                    }
                 }
             }
         })

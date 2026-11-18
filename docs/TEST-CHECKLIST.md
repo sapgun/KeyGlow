@@ -12,6 +12,22 @@ npm run test:rust
 
 These cover layout integrity, key-id roundtrips, the blocking state machine (including stuck-modifier prevention and emergency unlock), and settings load/save with a corrupt-file fallback.
 
+Safety convergence concurrency (P2) is covered by `cargo test` in
+`src-tauri/src/keyboard/safety.rs` — deterministic, no sleeps:
+
+- `reconciled_epoch_does_not_advance_before_work_completes` — claiming an
+  epoch must not advance the completion marker before the work ran.
+- `pending_epoch_survives_claim_without_work` — an elected-but-unworked
+  epoch stays pending so another path converges it (never silently lost).
+- `complete_reconcile_is_monotonic` — a late straggler never moves the
+  completion marker backwards.
+- `convergence_lock_serializes_worker_and_pump` — while one path holds the
+  convergence lock, another path's `try_lock` fails (channel-coordinated).
+- `worker_protocol_converges_latest_epoch_exactly_once` — five rapid
+  triggers coalesce into one convergence of the latest epoch.
+- `newer_epoch_during_work_is_not_lost` — a trigger landing mid-work is
+  picked up by the next loop iteration.
+
 ## Test 1 — Disable A
 
 1. Click `A` on the KeyGlow keyboard. It should look disabled (dark, dashed, strike).
