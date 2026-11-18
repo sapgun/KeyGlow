@@ -61,6 +61,34 @@ pub fn validate_remap_rule(
     if profile.disabled_keys.iter().any(|k| k == to) {
         return Err(format!("{to} is disabled in this profile; enable it first"));
     }
+    // S9: one key, one role. A remap source must not be a macro trigger,
+    // a macro cancel key, or a layer switch key — a remapped key injects
+    // instead of reaching the runner or the layer switch. A remap target
+    // must not be a macro trigger or a layer switch key either: injected
+    // input never starts a macro or switches a layer, so the rule would
+    // be a dead end for the user.
+    if profile
+        .macros
+        .iter()
+        .any(|m| m.trigger == from || m.cancel_key == from)
+    {
+        return Err(format!(
+            "{from} is a macro trigger or cancel key; it cannot be remapped"
+        ));
+    }
+    if profile.layers.iter().any(|l| l.switch_key == from) {
+        return Err(format!("{from} is a layer switch key; it cannot be remapped"));
+    }
+    if profile.macros.iter().any(|m| m.trigger == to) {
+        return Err(format!(
+            "{to} is a macro trigger; a remapped key cannot start a macro"
+        ));
+    }
+    if profile.layers.iter().any(|l| l.switch_key == to) {
+        return Err(format!(
+            "{to} is a layer switch key; a remapped key cannot switch layers"
+        ));
+    }
     Ok(RemapRule {
         from: from.to_string(),
         to: to.to_string(),
@@ -77,6 +105,374 @@ pub fn remap_participant(profile: &Profile, code: &str) -> Option<RemapRule> {
         .cloned()
 }
 
+// ---------------------------------------------------------------------------
+// S9: macros and layers
+//
+// One key, one role: a key may be a remap source/target, a macro trigger,
+// a macro cancel key, or a layer switch key — never two at once. The
+// validators below enforce that across all three collections, so the
+// engine can evaluate physical keys in one fixed order (emergency,
+// macro cancel, layer switch, macro trigger, remap, disable/forward)
+// without ambiguity. The cancel key is the one exception to the disable
+// rule: it cancels a running macro even if the profile disables it, so
+// a runaway macro can always be stopped.
+// ---------------------------------------------------------------------------
+
+/// S9: one step of a macro: a key down or up, executed after `delay_ms`
+/// milliseconds have passed since the previous step.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacroStepDef {
+    pub key: String,
+    pub action: String, // "down" | "up"
+    #[serde(default)]
+    pub delay_ms: u32,
+}
+
+/// S9: a macro: a trigger key starts a timed step sequence; `cancel_key`
+/// (default Escape) stops it mid-run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacroDef {
+    pub id: String,
+    pub name: String,
+    pub trigger: String,
+    #[serde(default = "default_cancel_key")]
+    pub cancel_key: String,
+    #[serde(default)]
+    pub steps: Vec<MacroStepDef>,
+}
+
+fn default_cancel_key() -> String {
+    "Escape".to_string()
+}
+
+/// S9: how a layer's switch key behaves: held down, or toggled per press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayerMode {
+    Hold,
+    Toggle,
+}
+
+/// S9: a layer: while active (switch key held / toggled), its
+/// `disabled_keys` and `remappings` replace the profile's base keymap.
+/// The base keymap is the profile's own `disabled_keys` / `remappings`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerDef {
+    pub id: String,
+    pub name: String,
+    pub switch_key: String,
+    #[serde(default = "default_layer_mode")]
+    pub mode: LayerMode,
+    #[serde(default)]
+    pub disabled_keys: Vec<String>,
+    #[serde(default)]
+    pub remappings: Vec<RemapRule>,
+}
+
+fn default_layer_mode() -> LayerMode {
+    LayerMode::Hold
+}
+
+/// S9: validate one macro against its profile (all collections present).
+/// The macro's own id is excluded from the duplicate-trigger test, so
+/// the same function validates a new macro and an edited one.
+pub fn validate_macro(profile: &Profile, def: &MacroDef) -> Result<(), String> {
+    validate_macro_with_layers(profile, def, true)
+}
+
+fn validate_macro_with_layers(
+    profile: &Profile,
+    def: &MacroDef,
+    check_layers: bool,
+) -> Result<(), String> {
+    if def.id.trim().is_empty() {
+        return Err("macro id is empty".into());
+    }
+    if def.name.trim().is_empty() {
+        return Err("macro name is empty".into());
+    }
+    let trigger = KeyCode::from_id(&def.trigger)
+        .ok_or_else(|| format!("unknown trigger key: {}", def.trigger))?;
+    if trigger == KeyCode::Pause {
+        return Err("Pause cannot trigger a macro (it has no key-up)".into());
+    }
+    if profile.disabled_keys.iter().any(|k| k == &def.trigger) {
+        return Err(format!("trigger {} is disabled on this profile", def.trigger));
+    }
+    if profile
+        .macros
+        .iter()
+        .any(|m| m.id != def.id && m.trigger == def.trigger)
+    {
+        return Err(format!(
+            "trigger {} is already used by another macro",
+            def.trigger
+        ));
+    }
+    if remap_participant(profile, &def.trigger).is_some() {
+        return Err(format!(
+            "trigger {} is a remap source or target; a remapped trigger would inject instead of starting",
+            def.trigger
+        ));
+    }
+    if check_layers
+        && profile
+            .layers
+            .iter()
+            .any(|l| l.switch_key == def.trigger)
+    {
+        return Err(format!(
+            "trigger {} is a layer switch key",
+            def.trigger
+        ));
+    }
+    let cancel = KeyCode::from_id(&def.cancel_key)
+        .ok_or_else(|| format!("unknown cancel key: {}", def.cancel_key))?;
+    if cancel == KeyCode::Pause {
+        return Err("Pause cannot cancel a macro (it has no key-up)".into());
+    }
+    if profile
+        .macros
+        .iter()
+        .any(|m| m.id != def.id && m.trigger == def.cancel_key)
+    {
+        return Err(format!(
+            "cancel key {} is another macro's trigger",
+            def.cancel_key
+        ));
+    }
+    if profile
+        .remappings
+        .iter()
+        .any(|r| r.from == def.cancel_key)
+    {
+        return Err(format!(
+            "cancel key {} is a remap source; a remapped cancel key would never reach the macro runner",
+            def.cancel_key
+        ));
+    }
+    if check_layers
+        && profile
+            .layers
+            .iter()
+            .any(|l| l.switch_key == def.cancel_key)
+    {
+        return Err(format!(
+            "cancel key {} is a layer switch key",
+            def.cancel_key
+        ));
+    }
+    if def.steps.is_empty() {
+        return Err("macro has no steps".into());
+    }
+    if def.steps.len() > crate::keyboard::macro_runner::MAX_MACRO_STEPS {
+        return Err(format!(
+            "macro has {} steps; the cap is {}",
+            def.steps.len(),
+            crate::keyboard::macro_runner::MAX_MACRO_STEPS
+        ));
+    }
+    // Balanced per key: downs and ups alternate, starting with down, and
+    // the run ends with nothing held — so a completed run can never
+    // leave a stuck key.
+    let mut held: HashSet<KeyCode> = HashSet::new();
+    for (i, step) in def.steps.iter().enumerate() {
+        let key = KeyCode::from_id(&step.key)
+            .ok_or_else(|| format!("step {}: unknown key: {}", i, step.key))?;
+        if step.delay_ms > crate::keyboard::macro_runner::MAX_STEP_DELAY_MS {
+            return Err(format!(
+                "step {}: delay {}ms exceeds the {}ms cap",
+                i,
+                step.delay_ms,
+                crate::keyboard::macro_runner::MAX_STEP_DELAY_MS
+            ));
+        }
+        if key == KeyCode::Pause {
+            return Err(format!("step {}: Pause cannot be a macro step", i));
+        }
+        if profile.disabled_keys.iter().any(|k| k == &step.key) {
+            return Err(format!(
+                "step {}: {} is disabled on this profile",
+                i, step.key
+            ));
+        }
+        if is_toggle_key(&step.key) {
+            return Err(format!(
+                "step {}: {} is a toggle key; the macro runner does not track LED state",
+                i, step.key
+            ));
+        }
+        match step.action.as_str() {
+            "down" => {
+                if !held.insert(key) {
+                    return Err(format!(
+                        "step {}: {} goes down twice without an up",
+                        i, step.key
+                    ));
+                }
+            }
+            "up" => {
+                if !held.remove(&key) {
+                    return Err(format!(
+                        "step {}: {} goes up without a prior down",
+                        i, step.key
+                    ));
+                }
+            }
+            other => {
+                return Err(format!("step {}: unknown action {other:?}", i));
+            }
+        }
+    }
+    if !held.is_empty() {
+        return Err("macro ends with a key still held down".into());
+    }
+    Ok(())
+}
+
+/// S9: validate one layer against its profile. The layer's own id is
+/// excluded from the duplicate-switch-key test, so the same function
+/// validates a new layer and an edited one.
+pub fn validate_layer(profile: &Profile, def: &LayerDef) -> Result<(), String> {
+    if def.id.trim().is_empty() {
+        return Err("layer id is empty".into());
+    }
+    if def.name.trim().is_empty() {
+        return Err("layer name is empty".into());
+    }
+    let switch = KeyCode::from_id(&def.switch_key)
+        .ok_or_else(|| format!("unknown switch key: {}", def.switch_key))?;
+    if switch == KeyCode::Pause {
+        return Err("Pause cannot switch a layer (it has no key-up)".into());
+    }
+    if profile
+        .disabled_keys
+        .iter()
+        .any(|k| k == &def.switch_key)
+    {
+        return Err(format!(
+            "switch key {} is disabled on this profile",
+            def.switch_key
+        ));
+    }
+    if profile
+        .layers
+        .iter()
+        .any(|l| l.id != def.id && l.switch_key == def.switch_key)
+    {
+        return Err(format!(
+            "switch key {} is already used by another layer",
+            def.switch_key
+        ));
+    }
+    if remap_participant(profile, &def.switch_key).is_some() {
+        return Err(format!(
+            "switch key {} is a remap source or target",
+            def.switch_key
+        ));
+    }
+    if profile
+        .macros
+        .iter()
+        .any(|m| m.trigger == def.switch_key || m.cancel_key == def.switch_key)
+    {
+        return Err(format!(
+            "switch key {} is a macro trigger or cancel key",
+            def.switch_key
+        ));
+    }
+    // Layer-local remaps: the same V1-V4 shape as base remaps, checked
+    // against the layer's own disabled list and the base disabled list.
+    // A base-disabled participant is dead in every layer, so it is
+    // rejected here too.
+    let mut seen_sources: HashSet<&str> = HashSet::new();
+    for r in &def.remappings {
+        let from = KeyCode::from_id(&r.from)
+            .ok_or_else(|| format!("unknown remap source: {}", r.from))?;
+        let to = KeyCode::from_id(&r.to)
+            .ok_or_else(|| format!("unknown remap target: {}", r.to))?;
+        if r.from == r.to {
+            return Err(format!("layer remap {} -> {} is a self-map", r.from, r.to));
+        }
+        if r.from == "Pause" || r.to == "Pause" {
+            return Err("Pause cannot be a layer remap source or target".into());
+        }
+        if is_toggle_key(&r.to) {
+            return Err(format!(
+                "layer remap target {} is a toggle key; LED state is not tracked",
+                r.to
+            ));
+        }
+        if !seen_sources.insert(r.from.as_str()) {
+            return Err(format!(
+                "layer remap source {} already has a rule in this layer",
+                r.from
+            ));
+        }
+        if r.from == def.switch_key || r.to == def.switch_key {
+            return Err(format!(
+                "layer remap {} -> {} uses the layer's own switch key",
+                r.from, r.to
+            ));
+        }
+        if def.disabled_keys.iter().any(|k| k == &r.from)
+            || def.disabled_keys.iter().any(|k| k == &r.to)
+        {
+            return Err(format!(
+                "layer remap {} -> {} uses a key disabled in this layer",
+                r.from, r.to
+            ));
+        }
+        if profile.disabled_keys.iter().any(|k| k == &r.to) {
+            return Err(format!(
+                "layer remap {} -> {} uses a target disabled on this profile (the injected target would be dropped)",
+                r.from, r.to
+            ));
+        }
+        // Note: a base-disabled *source* is allowed — the layer's remap
+        // re-enables it while the layer is active (QMK semantics; the
+        // engine's activate_layer keeps a remapped source enabled).
+        if profile
+            .macros
+            .iter()
+            .any(|m| m.trigger == r.from || m.trigger == r.to || m.cancel_key == r.from)
+        {
+            return Err(format!(
+                "layer remap {} -> {} uses a macro trigger or cancel key",
+                r.from, r.to
+            ));
+        }
+        let _ = (from, to);
+    }
+    // Layer-local disabled keys: unknown ids are rejected; the switch
+    // key stays live (it must be seen to turn the layer off), and a
+    // macro trigger must stay live too — the engine checks the trigger
+    // before the disable branch, so a disabled trigger would fire
+    // anyway and the layer's promise would be a lie.
+    for id in &def.disabled_keys {
+        let key = KeyCode::from_id(id)
+            .ok_or_else(|| format!("unknown disabled key: {id}"))?;
+        if *id == def.switch_key {
+            return Err(format!(
+                "layer cannot disable its own switch key {id}"
+            ));
+        }
+        if key == KeyCode::Pause {
+            return Err("layer cannot disable Pause".into());
+        }
+        if profile.macros.iter().any(|m| m.trigger == *id) {
+            return Err(format!(
+                "layer cannot disable macro trigger {id}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
@@ -89,6 +485,12 @@ pub struct Profile {
     /// version stays 1; old files load with an empty list.
     #[serde(default)]
     pub remappings: Vec<RemapRule>,
+    /// S9: macros defined on this profile (trigger -> step sequence).
+    #[serde(default)]
+    pub macros: Vec<MacroDef>,
+    /// S9: layers defined on this profile (switch key -> keymap override).
+    #[serde(default)]
+    pub layers: Vec<LayerDef>,
     #[serde(default)]
     pub builtin: bool,
 }
@@ -176,6 +578,8 @@ pub fn builtin_profiles() -> Vec<Profile> {
             layout: DEFAULT_LAYOUT.into(),
             disabled_keys: vec![],
             remappings: vec![],
+            macros: vec![],
+            layers: vec![],
             builtin: true,
         },
         Profile {
@@ -184,6 +588,8 @@ pub fn builtin_profiles() -> Vec<Profile> {
             layout: DEFAULT_LAYOUT.into(),
             disabled_keys: vec!["MetaLeft".into(), "MetaRight".into()],
             remappings: vec![],
+            macros: vec![],
+            layers: vec![],
             builtin: true,
         },
         Profile {
@@ -192,6 +598,8 @@ pub fn builtin_profiles() -> Vec<Profile> {
             layout: DEFAULT_LAYOUT.into(),
             disabled_keys: vec![],
             remappings: vec![],
+            macros: vec![],
+            layers: vec![],
             builtin: true,
         },
     ]
@@ -204,6 +612,8 @@ fn default_profile_entry() -> Profile {
         layout: DEFAULT_LAYOUT.into(),
         disabled_keys: vec![],
         remappings: vec![],
+        macros: vec![],
+        layers: vec![],
         builtin: true,
     }
 }
@@ -317,6 +727,70 @@ impl AppConfig {
             if profile.remappings.len() != before_rules {
                 tracing::warn!("profile {profile_id} remap rules cleaned during normalize");
             }
+            // S9: stored macros and layers that no longer validate are
+            // dropped at load, same philosophy. Priority on a hand-edited
+            // conflict is remap rules first, then macros, then layers:
+            // macros are validated without the layer check (a macro never
+            // loses to a layer), and layers are validated against the
+            // surviving macros. Each candidate is validated against a
+            // probe holding only the survivors so far, so the first
+            // valid item wins and its duplicates are dropped.
+            let before_macros = profile.macros.len();
+            let macros = std::mem::take(&mut profile.macros);
+            let mut kept_macros: Vec<MacroDef> = Vec::new();
+            for m in macros {
+                let probe = Profile {
+                    id: profile.id.clone(),
+                    name: String::new(),
+                    layout: profile.layout.clone(),
+                    disabled_keys: profile.disabled_keys.clone(),
+                    remappings: profile.remappings.clone(),
+                    macros: kept_macros.clone(),
+                    layers: vec![],
+                    builtin: profile.builtin,
+                };
+                if validate_macro_with_layers(&probe, &m, false).is_ok() {
+                    kept_macros.push(m);
+                } else {
+                    tracing::warn!(
+                        "profile {profile_id} had an invalid macro {}; removed",
+                        m.id
+                    );
+                }
+            }
+            kept_macros.truncate(crate::keyboard::macro_runner::MAX_MACROS_PER_PROFILE);
+            if kept_macros.len() != before_macros {
+                tracing::warn!("profile {profile_id} macros cleaned during normalize");
+            }
+            profile.macros = kept_macros;
+            let before_layers = profile.layers.len();
+            let layers = std::mem::take(&mut profile.layers);
+            let mut kept_layers: Vec<LayerDef> = Vec::new();
+            for l in layers {
+                let probe = Profile {
+                    id: profile.id.clone(),
+                    name: String::new(),
+                    layout: profile.layout.clone(),
+                    disabled_keys: profile.disabled_keys.clone(),
+                    remappings: profile.remappings.clone(),
+                    macros: profile.macros.clone(),
+                    layers: kept_layers.clone(),
+                    builtin: profile.builtin,
+                };
+                if validate_layer(&probe, &l).is_ok() {
+                    kept_layers.push(l);
+                } else {
+                    tracing::warn!(
+                        "profile {profile_id} had an invalid layer {}; removed",
+                        l.id
+                    );
+                }
+            }
+            kept_layers.truncate(crate::keyboard::macro_runner::MAX_LAYERS_PER_PROFILE);
+            if kept_layers.len() != before_layers {
+                tracing::warn!("profile {profile_id} layers cleaned during normalize");
+            }
+            profile.layers = kept_layers;
         }
         // Selected profile must exist.
         if !self.profiles.iter().any(|p| p.id == self.selected_profile) {
@@ -484,6 +958,8 @@ mod tests {
             layout: "fullsize-ansi".into(),
             disabled_keys: vec![],
             remappings: vec![],
+            macros: vec![],
+            layers: vec![],
             builtin: false,
         });
         cfg.activate_profile("wide").unwrap();
@@ -509,6 +985,8 @@ mod tests {
             layout: "my-iso".into(),
             disabled_keys: vec![],
             remappings: vec![],
+            macros: vec![],
+            layers: vec![],
             builtin: false,
         });
         let cfg = cfg.normalize();
@@ -540,6 +1018,8 @@ mod tests {
             layout: "my-jis".into(),
             disabled_keys: vec![],
             remappings: vec![],
+            macros: vec![],
+            layers: vec![],
             builtin: false,
         });
         let cfg = cfg.normalize();
@@ -575,6 +1055,8 @@ mod tests {
             layout: DEFAULT_LAYOUT.into(),
             disabled_keys: vec![],
             remappings: vec![],
+            macros: vec![],
+            layers: vec![],
             builtin: false,
         }
     }
@@ -688,5 +1170,256 @@ mod tests {
         )
         .unwrap();
         assert!(old.migrate().profile("default").unwrap().remappings.is_empty());
+    }
+
+    // --- S9: macro / layer validation -----------------------------------
+
+    fn macro_profile() -> Profile {
+        Profile {
+            id: "p".into(),
+            name: "P".into(),
+            layout: "60-ansi".into(),
+            disabled_keys: vec![],
+            remappings: vec![],
+            macros: vec![],
+            layers: vec![],
+            builtin: false,
+        }
+    }
+
+    fn ctrl_c_macro() -> MacroDef {
+        MacroDef {
+            id: "m1".into(),
+            name: "Copy".into(),
+            trigger: "F9".into(),
+            cancel_key: "Escape".into(),
+            steps: vec![
+                MacroStepDef {
+                    key: "ControlLeft".into(),
+                    action: "down".into(),
+                    delay_ms: 0,
+                },
+                MacroStepDef {
+                    key: "KeyC".into(),
+                    action: "down".into(),
+                    delay_ms: 10,
+                },
+                MacroStepDef {
+                    key: "KeyC".into(),
+                    action: "up".into(),
+                    delay_ms: 10,
+                },
+                MacroStepDef {
+                    key: "ControlLeft".into(),
+                    action: "up".into(),
+                    delay_ms: 0,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn macro_validation_accepts_balanced_macro() {
+        let profile = macro_profile();
+        assert!(validate_macro(&profile, &ctrl_c_macro()).is_ok());
+    }
+
+    #[test]
+    fn macro_validation_rejects_unbalanced_and_bad_steps() {
+        let profile = macro_profile();
+        // Up without a prior down.
+        let mut bad = ctrl_c_macro();
+        bad.steps.remove(0);
+        assert!(validate_macro(&profile, &bad).is_err());
+        // Ends with a key held.
+        let mut bad = ctrl_c_macro();
+        bad.steps.pop();
+        assert!(validate_macro(&profile, &bad).is_err());
+        // Double down on the same key.
+        let mut bad = ctrl_c_macro();
+        bad.steps[1].action = "down".into();
+        bad.steps[2].action = "down".into();
+        assert!(validate_macro(&profile, &bad).is_err());
+        // Pause step, toggle step, unknown key, unknown action, delay cap.
+        let mut bad = ctrl_c_macro();
+        bad.steps[0].key = "Pause".into();
+        assert!(validate_macro(&profile, &bad).is_err());
+        let mut bad = ctrl_c_macro();
+        bad.steps[0].key = "CapsLock".into();
+        assert!(validate_macro(&profile, &bad).is_err());
+        let mut bad = ctrl_c_macro();
+        bad.steps[0].key = "NotAKey".into();
+        assert!(validate_macro(&profile, &bad).is_err());
+        let mut bad = ctrl_c_macro();
+        bad.steps[0].action = "tap".into();
+        assert!(validate_macro(&profile, &bad).is_err());
+        let mut bad = ctrl_c_macro();
+        bad.steps[0].delay_ms = 5_001;
+        assert!(validate_macro(&profile, &bad).is_err());
+        // Empty steps, empty id/name, Pause trigger.
+        let mut bad = ctrl_c_macro();
+        bad.steps.clear();
+        assert!(validate_macro(&profile, &bad).is_err());
+        let mut bad = ctrl_c_macro();
+        bad.trigger = "Pause".into();
+        assert!(validate_macro(&profile, &bad).is_err());
+    }
+
+    #[test]
+    fn macro_validation_enforces_one_key_one_role() {
+        let mut profile = macro_profile();
+        profile.remappings.push(RemapRule {
+            from: "KeyA".into(),
+            to: "KeyB".into(),
+        });
+        profile.layers.push(LayerDef {
+            id: "l1".into(),
+            name: "Fn".into(),
+            switch_key: "F12".into(),
+            mode: LayerMode::Hold,
+            disabled_keys: vec![],
+            remappings: vec![],
+        });
+        // Trigger is a remap source / layer switch key.
+        let mut m = ctrl_c_macro();
+        m.trigger = "KeyA".into();
+        assert!(validate_macro(&profile, &m).is_err());
+        let mut m = ctrl_c_macro();
+        m.trigger = "F12".into();
+        assert!(validate_macro(&profile, &m).is_err());
+        // Cancel key is a remap source / layer switch key.
+        let mut m = ctrl_c_macro();
+        m.cancel_key = "KeyA".into();
+        assert!(validate_macro(&profile, &m).is_err());
+        let mut m = ctrl_c_macro();
+        m.cancel_key = "F12".into();
+        assert!(validate_macro(&profile, &m).is_err());
+        // Second macro with the same trigger.
+        profile.macros.push(ctrl_c_macro());
+        let mut m = ctrl_c_macro();
+        m.id = "m2".into();
+        assert!(validate_macro(&profile, &m).is_err());
+        // Editing the same macro (same id) is fine.
+        assert!(validate_macro(&profile, &ctrl_c_macro()).is_ok());
+    }
+
+    fn fn_layer() -> LayerDef {
+        LayerDef {
+            id: "l1".into(),
+            name: "Fn".into(),
+            switch_key: "CapsLock".into(),
+            mode: LayerMode::Hold,
+            disabled_keys: vec!["KeyQ".into()],
+            remappings: vec![RemapRule {
+                from: "KeyW".into(),
+                to: "ArrowUp".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn layer_validation_accepts_and_rejects() {
+        let profile = macro_profile();
+        assert!(validate_layer(&profile, &fn_layer()).is_ok());
+        // Switch key is Pause / disabled / a remap participant / a macro trigger.
+        let mut bad = fn_layer();
+        bad.switch_key = "Pause".into();
+        assert!(validate_layer(&profile, &bad).is_err());
+        let mut p = macro_profile();
+        p.disabled_keys.push("CapsLock".into());
+        assert!(validate_layer(&p, &fn_layer()).is_err());
+        let mut p = macro_profile();
+        p.remappings.push(RemapRule {
+            from: "CapsLock".into(),
+            to: "KeyB".into(),
+        });
+        assert!(validate_layer(&p, &fn_layer()).is_err());
+        let mut p = macro_profile();
+        p.macros.push(ctrl_c_macro());
+        let mut bad = fn_layer();
+        bad.switch_key = "F9".into();
+        assert!(validate_layer(&p, &bad).is_err());
+        // Layer disables its own switch key / a macro trigger.
+        let mut bad = fn_layer();
+        bad.disabled_keys.push("CapsLock".into());
+        assert!(validate_layer(&profile, &bad).is_err());
+        let mut p = macro_profile();
+        p.macros.push(ctrl_c_macro());
+        let mut bad = fn_layer();
+        bad.disabled_keys.push("F9".into());
+        assert!(validate_layer(&p, &bad).is_err());
+        // Layer remap uses a disabled key / the switch key / a macro trigger.
+        let mut bad = fn_layer();
+        bad.remappings.push(RemapRule {
+            from: "KeyQ".into(),
+            to: "KeyZ".into(),
+        });
+        assert!(validate_layer(&profile, &bad).is_err());
+        let mut bad = fn_layer();
+        bad.remappings.push(RemapRule {
+            from: "CapsLock".into(),
+            to: "KeyZ".into(),
+        });
+        assert!(validate_layer(&profile, &bad).is_err());
+        let mut p = macro_profile();
+        p.macros.push(ctrl_c_macro());
+        let mut bad = fn_layer();
+        bad.remappings.push(RemapRule {
+            from: "KeyE".into(),
+            to: "F9".into(),
+        });
+        assert!(validate_layer(&p, &bad).is_err());
+        // A layer remap whose source is base-disabled is allowed (the
+        // layer re-enables it); a base-disabled target is rejected (the
+        // injected target would be dropped by the hook).
+        let mut p = macro_profile();
+        p.disabled_keys.push("KeyW".into());
+        assert!(validate_layer(&p, &fn_layer()).is_ok());
+        let mut p = macro_profile();
+        p.disabled_keys.push("ArrowUp".into());
+        assert!(validate_layer(&p, &fn_layer()).is_err());
+    }
+
+    #[test]
+    fn normalize_drops_invalid_macros_and_layers_keeping_priority() {
+        let mut cfg = AppConfig::default();
+        let profile = cfg.profile_mut("default").unwrap();
+        profile.remappings.push(RemapRule {
+            from: "KeyA".into(),
+            to: "KeyB".into(),
+        });
+        // A macro whose trigger is a remap source loses to the rule.
+        let mut bad_macro = ctrl_c_macro();
+        bad_macro.trigger = "KeyA".into();
+        profile.macros.push(bad_macro);
+        profile.macros.push(ctrl_c_macro());
+        // A layer whose switch key is the surviving macro's trigger loses.
+        let mut bad_layer = fn_layer();
+        bad_layer.switch_key = "F9".into();
+        profile.layers.push(bad_layer);
+        profile.layers.push(fn_layer());
+        let cfg = cfg.normalize();
+        let profile = cfg.profile("default").unwrap();
+        assert_eq!(profile.macros.len(), 1);
+        assert_eq!(profile.macros[0].id, "m1");
+        assert_eq!(profile.layers.len(), 1);
+        assert_eq!(profile.layers[0].id, "l1");
+    }
+
+    #[test]
+    fn remap_validation_rejects_macro_and_layer_roles() {
+        let mut profile = macro_profile();
+        profile.macros.push(ctrl_c_macro());
+        profile.layers.push(fn_layer());
+        // Source is a macro trigger / cancel key / layer switch key.
+        assert!(validate_remap_rule("F9", "KeyB", &profile).is_err());
+        assert!(validate_remap_rule("Escape", "KeyB", &profile).is_err());
+        assert!(validate_remap_rule("CapsLock", "KeyB", &profile).is_err());
+        // Target is a macro trigger / layer switch key.
+        assert!(validate_remap_rule("KeyZ", "F9", &profile).is_err());
+        assert!(validate_remap_rule("KeyZ", "CapsLock", &profile).is_err());
+        // Target is a cancel key: injected input never cancels, so this
+        // one is allowed (the injected Escape is just an Escape).
+        assert!(validate_remap_rule("KeyZ", "Escape", &profile).is_ok());
     }
 }

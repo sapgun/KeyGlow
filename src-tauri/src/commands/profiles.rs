@@ -1,7 +1,9 @@
 use crate::profiles::app_profiles::{validate_rule, AppRule, MatchReason};
-use crate::profiles::models::RemapRule;
-use crate::profiles::{validate_remap_rule, Profile, DEFAULT_PROFILE_ID};
-use crate::state::{parse_key_ids, AppState};
+use crate::profiles::models::{LayerDef, MacroDef, RemapRule};
+use crate::profiles::{
+    validate_layer, validate_macro, validate_remap_rule, Profile, DEFAULT_PROFILE_ID,
+};
+use crate::state::AppState;
 use crate::tray;
 use super::keyboard::state_changed_payload;
 use serde::Serialize;
@@ -246,6 +248,199 @@ pub fn delete_remap_rule(
     Ok(())
 }
 
+/// S9: create or replace one macro on a profile (replace by id).
+/// Save-time validation rejects with a surfaced error, never silently
+/// fixed. If the profile is effective, the new definitions apply now (a
+/// running macro is cancelled first); otherwise they apply when the
+/// profile becomes effective. Follows the save_remap_rule stale-command
+/// pattern (P2).
+#[tauri::command]
+pub fn save_macro(
+    app: AppHandle,
+    state: State<AppState>,
+    profile_id: String,
+    macro_def: MacroDef,
+) -> Result<MacroDef, String> {
+    let entered = state.safety_epoch();
+    {
+        let cfg = state.config.lock();
+        let profile = cfg
+            .profile(&profile_id)
+            .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+        if !profile.macros.iter().any(|m| m.id == macro_def.id)
+            && profile.macros.len() >= crate::keyboard::macro_runner::MAX_MACROS_PER_PROFILE
+        {
+            return Err(format!(
+                "profile already has {} macros; delete one first",
+                crate::keyboard::macro_runner::MAX_MACROS_PER_PROFILE
+            ));
+        }
+        // Validate against the profile without the old version of this
+        // macro (replace semantics): editing keeps its trigger.
+        let mut probe = profile.clone();
+        probe.macros.retain(|m| m.id != macro_def.id);
+        validate_macro(&probe, &macro_def)?;
+    }
+    {
+        let mut cfg = state.config.lock();
+        let profile = cfg
+            .profile_mut(&profile_id)
+            .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+        profile.macros.retain(|m| m.id != macro_def.id);
+        profile.macros.push(macro_def.clone());
+    }
+    state.bump_runtime_revision();
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(macro_def);
+    }
+    if state.effective_profile_id() == profile_id {
+        state.apply_effective_profile_macros();
+    }
+    state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return Ok(macro_def);
+    }
+    let _ = app.emit("profile:changed", state.config.lock().clone());
+    let _ = app.emit("keyboard:state-changed", state_changed_payload(&state));
+    tracing::info!("macro saved: {profile_id} {}", macro_def.id);
+    Ok(macro_def)
+}
+
+/// S9: delete one macro (by id) from a profile. Deleting the macro of
+/// a running run cancels it (its held keys are released).
+#[tauri::command]
+pub fn delete_macro(
+    app: AppHandle,
+    state: State<AppState>,
+    profile_id: String,
+    macro_id: String,
+) -> Result<(), String> {
+    let entered = state.safety_epoch();
+    {
+        let mut cfg = state.config.lock();
+        let profile = cfg
+            .profile_mut(&profile_id)
+            .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+        if !profile.macros.iter().any(|m| m.id == macro_id) {
+            return Err(format!("unknown macro: {macro_id}"));
+        }
+        profile.macros.retain(|m| m.id != macro_id);
+    }
+    state.bump_runtime_revision();
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(());
+    }
+    if state.effective_profile_id() == profile_id {
+        state.apply_effective_profile_macros();
+    }
+    state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return Ok(());
+    }
+    let _ = app.emit("profile:changed", state.config.lock().clone());
+    let _ = app.emit("keyboard:state-changed", state_changed_payload(&state));
+    tracing::info!("macro deleted: {profile_id} {macro_id}");
+    Ok(())
+}
+
+/// S9: create or replace one layer on a profile (replace by id).
+/// Same stale-command pattern as save_macro; an active layer is
+/// deactivated before the new definitions install.
+#[tauri::command]
+pub fn save_layer(
+    app: AppHandle,
+    state: State<AppState>,
+    profile_id: String,
+    layer: LayerDef,
+) -> Result<LayerDef, String> {
+    let entered = state.safety_epoch();
+    {
+        let cfg = state.config.lock();
+        let profile = cfg
+            .profile(&profile_id)
+            .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+        if !profile.layers.iter().any(|l| l.id == layer.id)
+            && profile.layers.len() >= crate::keyboard::macro_runner::MAX_LAYERS_PER_PROFILE
+        {
+            return Err(format!(
+                "profile already has {} layers; delete one first",
+                crate::keyboard::macro_runner::MAX_LAYERS_PER_PROFILE
+            ));
+        }
+        let mut probe = profile.clone();
+        probe.layers.retain(|l| l.id != layer.id);
+        validate_layer(&probe, &layer)?;
+    }
+    {
+        let mut cfg = state.config.lock();
+        let profile = cfg
+            .profile_mut(&profile_id)
+            .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+        profile.layers.retain(|l| l.id != layer.id);
+        profile.layers.push(layer.clone());
+    }
+    state.bump_runtime_revision();
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(layer);
+    }
+    if state.effective_profile_id() == profile_id {
+        state.apply_effective_profile_layers();
+    }
+    state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return Ok(layer);
+    }
+    let _ = app.emit("profile:changed", state.config.lock().clone());
+    let _ = app.emit("keyboard:state-changed", state_changed_payload(&state));
+    tracing::info!("layer saved: {profile_id} {}", layer.id);
+    Ok(layer)
+}
+
+/// S9: delete one layer (by id) from a profile. Deleting the active
+/// layer deactivates it (its held remap targets are flushed).
+#[tauri::command]
+pub fn delete_layer(
+    app: AppHandle,
+    state: State<AppState>,
+    profile_id: String,
+    layer_id: String,
+) -> Result<(), String> {
+    let entered = state.safety_epoch();
+    {
+        let mut cfg = state.config.lock();
+        let profile = cfg
+            .profile_mut(&profile_id)
+            .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+        if !profile.layers.iter().any(|l| l.id == layer_id) {
+            return Err(format!("unknown layer: {layer_id}"));
+        }
+        profile.layers.retain(|l| l.id != layer_id);
+    }
+    state.bump_runtime_revision();
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(());
+    }
+    if state.effective_profile_id() == profile_id {
+        state.apply_effective_profile_layers();
+    }
+    state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return Ok(());
+    }
+    let _ = app.emit("profile:changed", state.config.lock().clone());
+    let _ = app.emit("keyboard:state-changed", state_changed_payload(&state));
+    tracing::info!("layer deleted: {profile_id} {layer_id}");
+    Ok(())
+}
+
 /// Explicit user resume: clears the manual override and the safety pause
 /// (set by emergency), then re-evaluates the current foreground app.
 /// Runtime-only: nothing is persisted. An emergency landing mid-command
@@ -377,6 +572,8 @@ pub fn create_profile(
         layout,
         disabled_keys: vec![],
         remappings: vec![],
+        macros: vec![],
+        layers: vec![],
         builtin: false,
     };
     let entered = state.safety_epoch();
@@ -428,8 +625,11 @@ pub fn duplicate_profile(
         layout: source.layout,
         disabled_keys: source.disabled_keys,
         // S8: the copy inherits the source's rules (its disabled set is
-        // copied too, so V3 still holds).
+        // copied too, so V3 still holds). S9: macros and layers travel
+        // with the copy for the same reason.
         remappings: source.remappings,
+        macros: source.macros,
+        layers: source.layers,
         builtin: false,
     };
     let entered = state.safety_epoch();
@@ -562,6 +762,35 @@ pub fn reset_profile(app: AppHandle, state: State<AppState>, id: String) -> Resu
         if profile.remappings.len() != before {
             tracing::warn!("reset_profile dropped remap rules conflicting with disabled keys");
         }
+        // S9: the same for macros and layers. A macro whose trigger or
+        // step is now disabled would go dead / silently drop a step; a
+        // layer whose switch key or remap participant is now disabled
+        // would lie the same way. (A disabled cancel key is fine — the
+        // engine checks the cancel before the disable branch.)
+        let before_macros = profile.macros.len();
+        profile.macros.retain(|m| {
+            !disabled.iter().any(|k| k == &m.trigger)
+                && !m
+                    .steps
+                    .iter()
+                    .any(|s| disabled.iter().any(|k| k == &s.key))
+        });
+        if profile.macros.len() != before_macros {
+            tracing::warn!("reset_profile dropped macros conflicting with disabled keys");
+        }
+        let before_layers = profile.layers.len();
+        profile.layers.retain(|l| {
+            // Only the target side: a base-disabled remap *source* still
+            // fires in the layer (the layer re-enables it).
+            !disabled.iter().any(|k| k == &l.switch_key)
+                && !l
+                    .remappings
+                    .iter()
+                    .any(|r| disabled.iter().any(|k| k == &r.to))
+        });
+        if profile.layers.len() != before_layers {
+            tracing::warn!("reset_profile dropped layers conflicting with disabled keys");
+        }
     }
     state.bump_runtime_revision();
     if state.safety.epoch() != entered {
@@ -571,16 +800,10 @@ pub fn reset_profile(app: AppHandle, state: State<AppState>, id: String) -> Resu
     }
     if state.effective_profile_id() == id {
         // S5: key edits apply to the *effective* profile (which may be an
-        // app-rule match, not the persisted manual selection).
-        let keys = {
-            let cfg = state.config.lock();
-            cfg.profile(&id)
-                .map(|p| parse_key_ids(&p.disabled_keys))
-                .unwrap_or_default()
-        };
-        state.controller.set_disabled_keys(&keys);
-        // S8: the reset may have dropped rules; re-apply the remainder.
-        state.apply_effective_profile_rules();
+        // app-rule match, not the persisted manual selection). S9: the
+        // reset may have dropped rules, macros, or layers; re-apply the
+        // whole effective keymap (flush first).
+        state.apply_effective_profile_keys();
     }
     state.persist()?;
     if state.safety.epoch() != entered {

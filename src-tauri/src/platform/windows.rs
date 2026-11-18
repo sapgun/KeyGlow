@@ -27,8 +27,8 @@ impl KeyboardController for WindowsController {
         self.engine.lock().is_enabled(key)
     }
 
-    fn set_disabled_keys(&self, keys: &[KeyCode]) {
-        self.engine.lock().set_disabled_keys(keys);
+    fn set_disabled_keys(&self, keys: &[KeyCode]) -> Vec<InjectAction> {
+        self.engine.lock().set_disabled_keys(keys)
     }
 
     fn disabled_keys(&self) -> Vec<KeyCode> {
@@ -58,6 +58,26 @@ impl KeyboardController for WindowsController {
     fn flush_remaps(&self) -> Vec<InjectAction> {
         self.engine.lock().flush_remaps()
     }
+
+    fn set_macros(&self, defs: &[crate::profiles::models::MacroDef]) -> Vec<InjectAction> {
+        self.engine.lock().set_macros(defs)
+    }
+
+    fn set_layers(&self, defs: &[crate::profiles::models::LayerDef]) -> Vec<InjectAction> {
+        self.engine.lock().set_layers(defs)
+    }
+
+    fn macro_tick_execute(&self, now_ms: u64) -> (bool, Option<u64>) {
+        crate::platform::macro_tick_execute_on(&self.engine, now_ms)
+    }
+
+    fn active_layer_id(&self) -> Option<String> {
+        self.engine.lock().active_layer_id()
+    }
+
+    fn cancel_macro(&self) -> Vec<InjectAction> {
+        self.engine.lock().macro_cancel()
+    }
 }
 
 pub fn start(
@@ -83,12 +103,27 @@ pub fn start(
         Ok(HookStart { handle, exit }) => {
             let shutdown_slot: Arc<Mutex<Option<HookHandle>>> = Arc::new(Mutex::new(Some(handle)));
             let shutdown_slot_clone = shutdown_slot.clone();
+            let shutdown_controller = controller.clone();
             ControllerStart {
                 controller,
                 events: rx,
                 hook_active: true,
                 hook_error: None,
                 shutdown: Arc::new(move || {
+                    // S9: stop any running macro first — release its held
+                    // keys before the hook goes away, or the keys it
+                    // holds would stick. The layer needs no release
+                    // here: its tables are engine state, not held keys.
+                    let release = shutdown_controller.cancel_macro();
+                    if !release.is_empty() {
+                        if let Err(err) =
+                            crate::keyboard::inject::execute_injections(&release)
+                        {
+                            tracing::error!(
+                                "macro cancel on shutdown failed ({err}); a macro key may stick"
+                            );
+                        }
+                    }
                     if let Some(handle) = shutdown_slot_clone.lock().take() {
                         handle.shutdown();
                     }

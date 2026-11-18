@@ -3,6 +3,7 @@ pub mod hook;
 pub mod hook_lifecycle;
 pub mod inject;
 pub mod keycodes;
+pub mod macro_runner;
 pub mod safety;
 
 pub use engine::{FilterEngine, InjectAction};

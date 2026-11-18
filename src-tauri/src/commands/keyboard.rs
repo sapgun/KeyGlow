@@ -57,6 +57,9 @@ pub struct AppSnapshot {
     pub app_rules: Vec<AppRule>,
     /// Master switch for automatic profile switching (S5).
     pub auto_profile_enabled: bool,
+    /// Id of the currently active layer, if any (S9). Null when the
+    /// base keymap is in effect.
+    pub active_layer_id: Option<String>,
 }
 
 /// Ordering envelope for state-affecting native events (P3). The UI applies
@@ -180,6 +183,7 @@ pub fn get_app_state(state: State<AppState>) -> AppSnapshot {
         active_exe,
         app_rules: cfg.app_rules,
         auto_profile_enabled: cfg.auto_profile_enabled,
+        active_layer_id: state.controller.active_layer_id(),
     }
 }
 
@@ -211,6 +215,51 @@ pub fn set_key_enabled(
                     "{code} is used by remap rule {} -> {}; remove the rule first",
                     rule.from, rule.to
                 ));
+            }
+            // S9: the same for macros and layers. A disabled trigger or
+            // switch key would go dead; a disabled macro step would be
+            // silently dropped by the injected lane (the hook consumes
+            // injected input for disabled keys); a disabled layer-remap
+            // target would be dropped the same way (a disabled source
+            // still fires in the layer — the layer re-enables it).
+            for m in &profile.macros {
+                if m.trigger == code {
+                    return Err(format!(
+                        "{code} triggers macro \"{}\"; delete the macro first",
+                        m.name
+                    ));
+                }
+                if m.cancel_key == code {
+                    return Err(format!(
+                        "{code} cancels macro \"{}\"; change its cancel key first",
+                        m.name
+                    ));
+                }
+                if m.steps.iter().any(|s| s.key == code) {
+                    return Err(format!(
+                        "{code} is a step of macro \"{}\"; remove the step first",
+                        m.name
+                    ));
+                }
+            }
+            for l in &profile.layers {
+                if l.switch_key == code {
+                    return Err(format!(
+                        "{code} switches layer \"{}\"; delete the layer first",
+                        l.name
+                    ));
+                }
+                // Only the target side: a layer remap whose *source* is
+                // disabled still fires while the layer is active (the
+                // layer re-enables it), but a disabled *target* would
+                // be dropped by the injected lane, so the rule would
+                // type nothing.
+                if l.remappings.iter().any(|r| r.to == code) {
+                    return Err(format!(
+                        "{code} is the target of a remap rule in layer \"{}\"; remove the rule first",
+                        l.name
+                    ));
+                }
             }
         }
         drop(cfg);
@@ -294,6 +343,17 @@ pub fn enable_all_keys(app: AppHandle, state: State<AppState>) -> Result<StateCh
 pub fn set_cat_lock(app: AppHandle, state: State<AppState>, locked: bool) -> Result<CatLockPayload, String> {
     let entered = state.safety_epoch();
     state.controller.set_cat_lock(locked);
+    if locked {
+        // S9: Cat Lock blocks the macro's injected steps at the hook, so
+        // a running macro would "run" while typing nothing. Cancel it
+        // instead — its held keys are released, and the run ends cleanly.
+        let release = state.controller.cancel_macro();
+        if !release.is_empty() {
+            if let Err(err) = crate::keyboard::inject::execute_injections(&release) {
+                tracing::error!("cat-lock macro cancel failed ({err}); a macro key may stick");
+            }
+        }
+    }
     // Runtime state changed even though cat lock never touches the disk (P3).
     state.bump_runtime_revision();
     if state.safety.epoch() != entered {
@@ -474,4 +534,204 @@ pub fn get_pressed_snapshot(state: State<AppState>) -> PressedSnapshot {
             .collect(),
         sequence: state.controller.event_sequence(),
     }
+}
+
+// --- S9: QMK / VIA keymap import and export ---------------------------------
+//
+// Import is destructive by design and says so in the dialog: it replaces
+// the profile's base disabled/remap set (from layer 0) and its layers
+// (from layers 1..n). Macros are untouched. Everything is validated
+// before anything is stored, so a failed import leaves the config and
+// the running keymap untouched.
+
+fn qmk_profile_for_import(
+    state: &AppState,
+    profile_id: &str,
+    layout_id: &str,
+) -> Result<(), String> {
+    let cfg = state.config.lock();
+    let profile = cfg
+        .profile(profile_id)
+        .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+    if profile.layout != layout_id {
+        return Err(format!(
+            "profile layout is {}, but the keymap is for {layout_id}; change the profile layout first",
+            profile.layout
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn validate_qmk_keymap(
+    state: State<AppState>,
+    profile_id: String,
+    json: String,
+    layout_id: String,
+    key_order: Vec<String>,
+) -> Result<crate::profiles::qmk::QmkImportPreview, String> {
+    qmk_profile_for_import(&state, &profile_id, &layout_id)?;
+    crate::profiles::qmk::validate_qmk_keymap(&json, &layout_id, &key_order)
+}
+
+#[tauri::command]
+pub fn import_qmk_keymap(
+    app: AppHandle,
+    state: State<AppState>,
+    profile_id: String,
+    json: String,
+    layout_id: String,
+    key_order: Vec<String>,
+) -> Result<StateChangedPayload, String> {
+    let entered = state.safety_epoch();
+    let import = crate::profiles::qmk::qmk_keymap_to_profile(&json, &layout_id, &key_order)?;
+    {
+        let mut cfg = state.config.lock();
+        let profile = cfg
+            .profile_mut(&profile_id)
+            .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+        if profile.layout != layout_id {
+            return Err(format!(
+                "profile layout is {}, but the keymap is for {layout_id}",
+                profile.layout
+            ));
+        }
+        profile.disabled_keys = import.base_disabled;
+        profile.remappings = import.base_remappings;
+        profile.layers = import.layers;
+    }
+    // The import replaces the effective keymap; install it (flush first).
+    if state.effective_profile_id() == profile_id {
+        state.apply_effective_profile_keys();
+    }
+    state.bump_runtime_revision();
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(state_changed_payload(&state));
+    }
+    state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return Ok(state_changed_payload(&state));
+    }
+    let _ = app.emit("profile:changed", state.config.lock().clone());
+    let _ = app.emit("keyboard:state-changed", state_changed_payload(&state));
+    tracing::info!(profile_id, "imported QMK keymap");
+    Ok(state_changed_payload(&state))
+}
+
+#[tauri::command]
+pub fn validate_via_keymap(
+    state: State<AppState>,
+    profile_id: String,
+    json: String,
+    layout_id: String,
+    key_order: Vec<String>,
+) -> Result<crate::profiles::qmk::QmkImportPreview, String> {
+    qmk_profile_for_import(&state, &profile_id, &layout_id)?;
+    crate::profiles::qmk::validate_via_keymap(&json, &layout_id, &key_order)
+}
+
+#[tauri::command]
+pub fn import_via_keymap(
+    app: AppHandle,
+    state: State<AppState>,
+    profile_id: String,
+    json: String,
+    layout_id: String,
+    key_order: Vec<String>,
+) -> Result<StateChangedPayload, String> {
+    let entered = state.safety_epoch();
+    let import = crate::profiles::qmk::via_keymap_to_profile(&json, &layout_id, &key_order)?;
+    {
+        let mut cfg = state.config.lock();
+        let profile = cfg
+            .profile_mut(&profile_id)
+            .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+        if profile.layout != layout_id {
+            return Err(format!(
+                "profile layout is {}, but the keymap is for {layout_id}",
+                profile.layout
+            ));
+        }
+        profile.disabled_keys = import.base_disabled;
+        profile.remappings = import.base_remappings;
+        profile.layers = import.layers;
+    }
+    if state.effective_profile_id() == profile_id {
+        state.apply_effective_profile_keys();
+    }
+    state.bump_runtime_revision();
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(state_changed_payload(&state));
+    }
+    state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return Ok(state_changed_payload(&state));
+    }
+    let _ = app.emit("profile:changed", state.config.lock().clone());
+    let _ = app.emit("keyboard:state-changed", state_changed_payload(&state));
+    tracing::info!(profile_id, "imported VIA keymap");
+    Ok(state_changed_payload(&state))
+}
+
+#[tauri::command]
+pub fn export_qmk_keymap(
+    state: State<AppState>,
+    profile_id: String,
+    layout_id: String,
+    key_order: Vec<String>,
+    keyboard: Option<String>,
+    keymap: Option<String>,
+) -> Result<String, String> {
+    let cfg = state.config.lock();
+    let profile = cfg
+        .profile(&profile_id)
+        .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+    if profile.layout != layout_id {
+        return Err(format!(
+            "profile layout is {}, but the keymap is for {layout_id}",
+            profile.layout
+        ));
+    }
+    let keyboard = keyboard.unwrap_or_else(|| "keyglow".into());
+    let keymap = keymap.unwrap_or_else(|| profile_id.clone());
+    crate::profiles::qmk::profile_to_qmk_keymap(
+        &keyboard,
+        &keymap,
+        &layout_id,
+        &key_order,
+        &profile.disabled_keys,
+        &profile.remappings,
+        &profile.layers,
+    )
+}
+
+#[tauri::command]
+pub fn export_via_keymap(
+    state: State<AppState>,
+    profile_id: String,
+    layout_id: String,
+    key_order: Vec<String>,
+) -> Result<String, String> {
+    let cfg = state.config.lock();
+    let profile = cfg
+        .profile(&profile_id)
+        .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+    if profile.layout != layout_id {
+        return Err(format!(
+            "profile layout is {}, but the keymap is for {layout_id}",
+            profile.layout
+        ));
+    }
+    crate::profiles::qmk::profile_to_via_keymap(
+        &profile_id,
+        &layout_id,
+        &key_order,
+        &profile.disabled_keys,
+        &profile.remappings,
+        &profile.layers,
+    )
 }
