@@ -1,4 +1,4 @@
-import { LAYOUTS, layoutDescription, layoutOptionLabel } from "../lib/layouts";
+import { allLayouts, layoutDescription, layoutOptionLabel, layoutSource } from "../lib/layouts";
 import { useLocale, useT } from "../hooks/useT";
 
 interface LayoutSelectorProps {
@@ -9,6 +9,7 @@ interface LayoutSelectorProps {
 export function LayoutSelector({ value, onChange }: LayoutSelectorProps) {
   const t = useT();
   const locale = useLocale();
+  const layouts = allLayouts();
 
   return (
     <label className="flex min-w-56 flex-col gap-1">
@@ -19,9 +20,10 @@ export function LayoutSelector({ value, onChange }: LayoutSelectorProps) {
         className="h-9 max-w-xs rounded-lg border border-border bg-panel-2 px-3 text-sm outline-none focus:border-lime/40"
         title={layoutDescription(value, locale)}
       >
-        {LAYOUTS.map((layout) => (
+        {layouts.map((layout) => (
           <option key={layout.id} value={layout.id}>
             {layoutOptionLabel(layout.id, locale)}
+            {layoutSource(layout.id) === "custom" ? ` [${t("customLayoutBadge")}]` : ""}
           </option>
         ))}
       </select>

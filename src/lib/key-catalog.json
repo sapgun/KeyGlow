@@ -103,7 +103,13 @@
     "Numpad6",
     "Numpad7",
     "Numpad8",
-    "Numpad9"
+    "Numpad9",
+    "IntlBackslash",
+    "IntlYen",
+    "IntlRo",
+    "Convert",
+    "NonConvert",
+    "KanaMode"
   ],
   "unsupportedVisual": [
     "Fn"

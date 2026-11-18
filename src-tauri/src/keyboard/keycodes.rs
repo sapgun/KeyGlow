@@ -108,10 +108,26 @@ pub enum KeyCode {
     Numpad9,
     NumpadDecimal,
     NumpadEnter,
+    /// ISO extra key between Left Shift and Z (scan 0x56, VK_OEM_102).
+    /// S6: same VK as IntlRo; the scan code disambiguates (see identify_key).
+    IntlBackslash,
+    /// JIS yen key between Equal and Backspace (scan 0x7D).
+    /// S6: VK_OEM_5 is provisional (AHK documents vkDCsc07D); confirm on
+    /// real JIS hardware. Scan 0x7D disambiguates from Backslash (0x2B).
+    IntlYen,
+    /// JIS ro key between Slash and Right Shift (scan 0x73, VK_OEM_102).
+    /// S6: same VK as IntlBackslash; the scan code disambiguates.
+    IntlRo,
+    /// JIS henkan key, right of Space (scan 0x79, VK_CONVERT 0x1C).
+    Convert,
+    /// JIS muhenkan key, left of Space (scan 0x7B, VK_NONCONVERT 0x1D).
+    NonConvert,
+    /// JIS kana key, right of Convert (scan 0x70, VK_KANA 0x15).
+    KanaMode,
 }
 
 impl KeyCode {
-    pub const COUNT: usize = 104;
+    pub const COUNT: usize = 110;
 
     pub const ALL: [KeyCode; Self::COUNT] = [
         Self::Escape,
@@ -218,6 +234,12 @@ impl KeyCode {
         Self::Numpad9,
         Self::NumpadDecimal,
         Self::NumpadEnter,
+        Self::IntlBackslash,
+        Self::IntlYen,
+        Self::IntlRo,
+        Self::Convert,
+        Self::NonConvert,
+        Self::KanaMode,
     ];
 
     pub fn index(self) -> usize {
@@ -330,6 +352,12 @@ impl KeyCode {
             Self::Numpad9 => "Numpad9",
             Self::NumpadDecimal => "NumpadDecimal",
             Self::NumpadEnter => "NumpadEnter",
+            Self::IntlBackslash => "IntlBackslash",
+            Self::IntlYen => "IntlYen",
+            Self::IntlRo => "IntlRo",
+            Self::Convert => "Convert",
+            Self::NonConvert => "NonConvert",
+            Self::KanaMode => "KanaMode",
         }
     }
 
@@ -439,6 +467,12 @@ impl KeyCode {
             "Numpad9" => Self::Numpad9,
             "NumpadDecimal" => Self::NumpadDecimal,
             "NumpadEnter" => Self::NumpadEnter,
+            "IntlBackslash" => Self::IntlBackslash,
+            "IntlYen" => Self::IntlYen,
+            "IntlRo" => Self::IntlRo,
+            "Convert" => Self::Convert,
+            "NonConvert" => Self::NonConvert,
+            "KanaMode" => Self::KanaMode,
             _ => return None,
         })
     }
@@ -449,6 +483,13 @@ impl KeyCode {
 /// Left/right modifiers are distinguished using the virtual-key when Windows
 /// supplies `VK_L*`/`VK_R*`, otherwise scan code (Shift) or the extended bit
 /// (Ctrl/Alt/Enter).
+///
+/// S6: two VKs are shared and need the scan code to disambiguate:
+/// - VK_OEM_102 (0xE2): scan 0x56 is the ISO extra key (IntlBackslash),
+///   scan 0x73 is the JIS ro key (IntlRo).
+/// - VK_OEM_5 (0xDC): scan 0x2B is the ANSI Backslash / ISO # / JIS ] key
+///   (all the same physical key, reported as Backslash; layouts differ
+///   only by label), scan 0x7D is the JIS yen key (IntlYen, VK provisional).
 pub fn identify_key(vk: u32, scan: u32, extended: bool) -> Option<KeyCode> {
     match vk {
         0x10 | 0xA0 | 0xA1 => {
@@ -523,7 +564,27 @@ pub fn identify_key(vk: u32, scan: u32, extended: bool) -> Option<KeyCode> {
         0x50 => Some(KeyCode::KeyP),
         0xDB => Some(KeyCode::BracketLeft),
         0xDD => Some(KeyCode::BracketRight),
-        0xDC => Some(KeyCode::Backslash),
+        0xDC => {
+            // S6: same VK for the ANSI Backslash / ISO # / JIS ] key
+            // (scan 0x2B) and the JIS yen key (scan 0x7D, VK provisional).
+            if scan == 0x7D {
+                Some(KeyCode::IntlYen)
+            } else {
+                Some(KeyCode::Backslash)
+            }
+        }
+        0xE2 => {
+            // S6: VK_OEM_102 is shared by the ISO extra key (scan 0x56)
+            // and the JIS ro key (scan 0x73).
+            if scan == 0x73 {
+                Some(KeyCode::IntlRo)
+            } else {
+                Some(KeyCode::IntlBackslash)
+            }
+        }
+        0x1C => Some(KeyCode::Convert),
+        0x1D => Some(KeyCode::NonConvert),
+        0x15 => Some(KeyCode::KanaMode),
         0x14 => Some(KeyCode::CapsLock),
         0x41 => Some(KeyCode::KeyA),
         0x53 => Some(KeyCode::KeyS),
@@ -628,5 +689,48 @@ mod tests {
         assert_eq!(identify_key(0x70, 0x3B, false), Some(KeyCode::F1));
         assert_eq!(identify_key(0x20, 0x39, false), Some(KeyCode::Space));
         assert_eq!(identify_key(0xFF, 0x00, false), None);
+    }
+
+    #[test]
+    fn iso_jis_keys_identified() {
+        // S6: shared VKs disambiguated by scan code.
+        assert_eq!(
+            identify_key(0xE2, 0x56, false),
+            Some(KeyCode::IntlBackslash)
+        );
+        assert_eq!(identify_key(0xE2, 0x73, false), Some(KeyCode::IntlRo));
+        assert_eq!(identify_key(0xDC, 0x7D, false), Some(KeyCode::IntlYen));
+        // Scan 0x2B is one physical key on all three layouts: ANSI
+        // Backslash, ISO #, JIS ]. The hook reports it as Backslash;
+        // layouts differ only by label.
+        assert_eq!(identify_key(0xDC, 0x2B, false), Some(KeyCode::Backslash));
+        assert_eq!(identify_key(0x1C, 0x79, false), Some(KeyCode::Convert));
+        assert_eq!(identify_key(0x1D, 0x7B, false), Some(KeyCode::NonConvert));
+        assert_eq!(identify_key(0x15, 0x70, false), Some(KeyCode::KanaMode));
+    }
+
+    /// S6: the Rust KeyCode catalog and the TS key catalog
+    /// (src/lib/key-catalog.json, generated from scripts/generate-layouts.mjs)
+    /// must name exactly the same key set. A drift in either direction
+    /// fails here (Windows CI) and in scripts/test-catalog-sync.mjs.
+    #[test]
+    fn catalog_matches_ts_key_catalog() {
+        let raw = include_str!("../../../src/lib/key-catalog.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw).expect("key-catalog.json must parse");
+        let codes = parsed["codes"]
+            .as_array()
+            .expect("key-catalog.json needs a codes array");
+        let ts: std::collections::HashSet<&str> = codes
+            .iter()
+            .map(|v| v.as_str().expect("catalog codes must be strings"))
+            .collect();
+        let rust: std::collections::HashSet<&str> =
+            KeyCode::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(rust, ts, "Rust KeyCode set != TS key-catalog.json set");
+        // Every catalog code round-trips through from_id.
+        for code in &ts {
+            assert!(KeyCode::from_id(code).is_some(), "unknown code {code}");
+        }
     }
 }

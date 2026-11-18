@@ -5,10 +5,12 @@ import type {
   AppSnapshot,
   AutoSwitchedPayload,
   EmergencyPayload,
+  KeyboardLayout,
   MatchReason,
   Profile,
 } from "../types/keyboard";
 import * as api from "../lib/tauri";
+import { setCustomLayouts } from "../lib/layouts";
 import { detectLocale, parseLocale, type Locale } from "../i18n";
 import { applyTheme, parseTheme, readStoredTheme, type Theme } from "../lib/theme";
 
@@ -51,6 +53,14 @@ interface AppStore {
   layoutId: string;
   profileId: string;
   profiles: Profile[];
+  /** S6: imported custom layouts (mirrored into the layout registry). */
+  customLayouts: KeyboardLayout[];
+  /**
+   * S6: layout waiting in the import preview. Set by the import dialog
+   * after validation; applying it is a separate step, and cancelling
+   * leaves the current layout untouched.
+   */
+  importPreview: KeyboardLayout | null;
   disabledKeys: string[];
   pressedKeys: string[];
   staleKeys: string[];
@@ -104,6 +114,14 @@ interface AppStore {
   toggleKey: (code: string) => Promise<void>;
   enableAll: () => Promise<void>;
   chooseLayout: (id: string) => Promise<void>;
+  /** S6: hold a validated layout in the import preview (no backend call). */
+  beginImportPreview: (layout: KeyboardLayout) => void;
+  /** S6: drop the import preview; the current layout is untouched. */
+  cancelImportPreview: () => void;
+  /** S6: persist the previewed layout, then select it. */
+  confirmImportPreview: () => Promise<void>;
+  /** S6: delete an imported custom layout (refused while in use). */
+  deleteCustomLayout: (id: string) => Promise<void>;
   chooseProfile: (id: string) => Promise<void>;
   newProfile: (name: string) => Promise<void>;
   copyProfile: () => Promise<void>;
@@ -138,6 +156,10 @@ function apply(snapshot: AppSnapshot): Partial<AppStore> | null {
   // instead of overwriting newer (e.g. post-emergency) state.
   if (!isFreshStamp(snapshot.safetyEpoch, snapshot.runtimeRevision)) return null;
   markAppliedStamp(snapshot.safetyEpoch, snapshot.runtimeRevision);
+  // S6: mirror the backend custom layouts into the layout registry so
+  // getLayout/allLayouts see imported layouts.
+  const customLayouts = snapshot.customLayouts ?? [];
+  setCustomLayouts(customLayouts);
   return {
     hydrated: true,
     hookActive: snapshot.hookActive,
@@ -145,6 +167,7 @@ function apply(snapshot: AppSnapshot): Partial<AppStore> | null {
     layoutId: snapshot.layoutId,
     profileId: snapshot.profileId,
     profiles: snapshot.profiles,
+    customLayouts,
     disabledKeys: snapshot.disabledKeys,
     onboarded: snapshot.onboarded,
     startWithWindows: snapshot.startWithWindows,
@@ -221,6 +244,8 @@ export const useAppStore = create<AppStore>((set, get) => {
   layoutId: "tkl-ansi",
   profileId: "default",
   profiles: [],
+  customLayouts: [],
+  importPreview: null,
   disabledKeys: [],
   pressedKeys: [],
   staleKeys: [],
@@ -362,6 +387,53 @@ export const useAppStore = create<AppStore>((set, get) => {
       await api.selectLayout(id);
       if (!isCurrentCommand(rev)) return;
       set({ layoutId: id, onboarded: true, error: null });
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      await fail(err);
+    }
+  },
+
+  beginImportPreview: (layout) => {
+    // Pure local state: no backend call, no layout change. The dialog
+    // validates before calling this.
+    set({ importPreview: layout, error: null });
+  },
+
+  cancelImportPreview: () => {
+    // The preview never touched layoutId, so cancelling restores
+    // nothing — the original layout is still selected.
+    set({ importPreview: null });
+  },
+
+  confirmImportPreview: async () => {
+    const preview = get().importPreview;
+    if (!preview) return;
+    const rev = beginCommand();
+    try {
+      await api.importLayout(JSON.stringify(preview));
+      if (!isCurrentCommand(rev)) return;
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
+      const next = apply(snapshot);
+      if (next) set(next);
+      // Select the imported layout after it is stored.
+      await api.selectLayout(preview.id);
+      if (!isCurrentCommand(rev)) return;
+      set({ layoutId: preview.id, importPreview: null, onboarded: true, error: null });
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      await fail(err);
+    }
+  },
+
+  deleteCustomLayout: async (id) => {
+    const rev = beginCommand();
+    try {
+      await api.deleteCustomLayout(id);
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
+      const next = apply(snapshot);
+      if (next) set(next);
     } catch (err) {
       if (!isCurrentCommand(rev)) return;
       await fail(err);

@@ -1,6 +1,7 @@
 use crate::keyboard::KeyCode;
 use crate::profiles::app_profiles::{AppRule, EffectiveChange, MatchReason};
-use crate::profiles::models::VALID_LAYOUT_IDS;
+use crate::profiles::layout_import::{validate_imported_layout, ImportedLayout};
+use crate::profiles::layout_registry::is_valid_layout_id;
 use crate::state::AppState;
 use serde::Serialize;
 use std::sync::atomic::Ordering;
@@ -17,6 +18,9 @@ pub struct AppSnapshot {
     /// rule matched; `match_reason` says why.
     pub profile_id: String,
     pub profiles: Vec<crate::profiles::Profile>,
+    /// Imported custom layouts (S6). Builtin layouts come from the
+    /// frontend registry; only customs cross the IPC boundary here.
+    pub custom_layouts: Vec<crate::profiles::layout_import::ImportedLayout>,
     pub disabled_keys: Vec<String>,
     pub onboarded: bool,
     pub start_with_windows: bool,
@@ -154,6 +158,7 @@ pub fn get_app_state(state: State<AppState>) -> AppSnapshot {
         layout_id: cfg.selected_layout,
         profile_id: effective,
         profiles: cfg.profiles,
+        custom_layouts: cfg.custom_layouts,
         disabled_keys: state.snapshot_disabled(),
         onboarded: cfg.onboarded,
         start_with_windows: cfg.start_with_windows,
@@ -280,11 +285,11 @@ pub fn set_cat_lock(app: AppHandle, state: State<AppState>, locked: bool) -> Res
 
 #[tauri::command]
 pub fn select_layout(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
-    if !VALID_LAYOUT_IDS.contains(&id.as_str()) {
-        return Err(format!("unknown layout: {id}"));
-    }
     {
         let mut cfg = state.config.lock();
+        if !is_valid_layout_id(&id, &cfg.custom_layouts) {
+            return Err(format!("unknown layout: {id}"));
+        }
         cfg.selected_layout = id.clone();
         if let Some(profile) = cfg.current_profile_mut() {
             profile.layout = id;
@@ -295,6 +300,68 @@ pub fn select_layout(app: AppHandle, state: State<AppState>, id: String) -> Resu
     state.persist()?;
     let _ = app.emit("profile:changed", state.config.lock().clone());
     Ok(())
+}
+
+/// S6: import a layout from a JSON string. The JSON is validated
+/// (size, key count, coordinates, id format, unknown fields, duplicate
+/// codes, overlaps) before anything is stored; on failure the config
+/// is untouched and the current layout stays selected.
+#[tauri::command]
+pub fn import_layout(
+    app: AppHandle,
+    state: State<AppState>,
+    json: String,
+) -> Result<ImportedLayout, String> {
+    let layout = validate_imported_layout(&json)?;
+    {
+        let mut cfg = state.config.lock();
+        if cfg.custom_layouts.iter().any(|l| l.id == layout.id) {
+            return Err(format!("layout id already exists: {}", layout.id));
+        }
+        cfg.custom_layouts.push(layout.clone());
+    }
+    state.bump_runtime_revision();
+    state.persist()?;
+    let _ = app.emit("profile:changed", state.config.lock().clone());
+    tracing::info!(
+        id = layout.id,
+        keys = layout.keys.len(),
+        "imported custom layout"
+    );
+    Ok(layout)
+}
+
+/// S6: delete an imported custom layout. Refused while any profile
+/// (or the current selection) still uses it, so no profile is left
+/// pointing at a missing layout.
+#[tauri::command]
+pub fn delete_custom_layout(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+) -> Result<(), String> {
+    {
+        let mut cfg = state.config.lock();
+        if !cfg.custom_layouts.iter().any(|l| l.id == id) {
+            return Err(format!("unknown custom layout: {id}"));
+        }
+        if cfg.selected_layout == id || cfg.profiles.iter().any(|p| p.layout == id) {
+            return Err(format!("layout {id} is in use by a profile"));
+        }
+        cfg.custom_layouts.retain(|l| l.id != id);
+    }
+    state.bump_runtime_revision();
+    state.persist()?;
+    let _ = app.emit("profile:changed", state.config.lock().clone());
+    tracing::info!(id, "deleted custom layout");
+    Ok(())
+}
+
+/// S6: list imported custom layouts (builtin layouts come from the
+/// frontend registry, not from here).
+#[tauri::command]
+pub fn list_custom_layouts(state: State<AppState>) -> Vec<ImportedLayout> {
+    state.config.lock().custom_layouts.clone()
 }
 
 #[tauri::command]

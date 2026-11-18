@@ -80,6 +80,8 @@ export interface AppSnapshot {  hookActive: boolean;
   /** Effective profile (S5): what actually filters keys now. */
   profileId: string;
   profiles: Profile[];
+  /** Imported custom layouts (S6). Builtin layouts come from the frontend registry. */
+  customLayouts: KeyboardLayout[];
   disabledKeys: string[];
   onboarded: boolean;
   startWithWindows: boolean;
