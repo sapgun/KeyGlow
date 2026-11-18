@@ -65,6 +65,12 @@ const snap = (over = {}) => ({
   safetyEpoch: 0,
   safetyReconciled: 0,
   runtimeRevision: 1,
+  matchReason: "default",
+  autoProfilePaused: false,
+  manualOverride: null,
+  activeExe: null,
+  appRules: [],
+  autoProfileEnabled: true,
   ...over,
 });
 
@@ -262,6 +268,130 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   cl = "unset";
   __fire("keyboard:cat-lock", true); // legacy boolean
   check("T8 legacy boolean cat-lock ignored", cl === "unset");
+
+  let as = "unset";
+  await tauri.onAutoSwitched((p) => {
+    as = p;
+  });
+  __fire("profile:auto-switched", {
+    profileId: "gaming",
+    matchReason: "app-rule",
+    activeExe: "c:\\games\\game.exe",
+    safetyEpoch: 5,
+    runtimeRevision: 100,
+  });
+  check(
+    "T8 auto-switched parsed",
+    eq(as, {
+      profileId: "gaming",
+      matchReason: "app-rule",
+      activeExe: "c:\\games\\game.exe",
+      safetyEpoch: 5,
+      runtimeRevision: 100,
+    }),
+  );
+  as = "unset";
+  __fire("profile:auto-switched", { profileId: "gaming", matchReason: "bogus" });
+  check("T8 malformed auto-switched ignored", as === "unset");
+  __fire("profile:auto-switched", { profileId: "gaming" }); // missing stamp
+  check("T8 unstamped auto-switched ignored", as === "unset");
+}
+
+// ---------------------------------------------------------------- T9
+// S5: the snapshot carries the app-profile status, and the auto-switch
+// event applies through the same P3 ordering gate as every other native
+// event — a late switch can never overwrite newer (manual or
+// post-emergency) state.
+{
+  const useAppStore = await freshStore();
+  __resetInvoke();
+  const rule = {
+    id: "r1",
+    executablePath: "C:\\Games\\game.exe",
+    profileId: "gaming",
+    enabled: true,
+    priority: 0,
+  };
+  __mockInvoke("get_app_state", () =>
+    snap({
+      profileId: "gaming",
+      matchReason: "app-rule",
+      autoProfilePaused: false,
+      manualOverride: null,
+      activeExe: "c:\\games\\game.exe",
+      appRules: [rule],
+      autoProfileEnabled: true,
+      runtimeRevision: 10,
+    }),
+  );
+  await useAppStore.getState().hydrate();
+  const s = useAppStore.getState();
+  check("T9 snapshot carries match reason", s.matchReason === "app-rule");
+  check("T9 snapshot carries active exe", s.activeExe === "c:\\games\\game.exe");
+  check("T9 snapshot carries rules", eq(s.appRules, [rule]));
+  check("T9 snapshot carries auto enabled", s.autoProfileEnabled === true);
+  check("T9 snapshot effective profile", s.profileId === "gaming");
+}
+
+// T9b/c: auto-switch event gating.
+{
+  const useAppStore = await freshStore();
+  const st = useAppStore.getState();
+  st.applyAutoSwitched({
+    profileId: "gaming",
+    matchReason: "app-rule",
+    activeExe: "c:\\games\\game.exe",
+    safetyEpoch: 0,
+    runtimeRevision: 5,
+  });
+  check("T9 fresh auto-switch applies", useAppStore.getState().profileId === "gaming");
+  check("T9 auto-switch reason applies", useAppStore.getState().matchReason === "app-rule");
+  check("T9 auto-switch exe applies", useAppStore.getState().activeExe === "c:\\games\\game.exe");
+  // A stale switch (older stamp) is dropped.
+  st.applyAutoSwitched({
+    profileId: "coding",
+    matchReason: "app-rule",
+    activeExe: "c:\\windows\\notepad.exe",
+    safetyEpoch: 0,
+    runtimeRevision: 3,
+  });
+  check("T9 stale auto-switch dropped", useAppStore.getState().profileId === "gaming");
+  // An emergency floors the stamp: anything older is dropped.
+  st.showEmergency({ epoch: 6, runtimeRevision: 101 });
+  st.applyAutoSwitched({
+    profileId: "gaming",
+    matchReason: "app-rule",
+    activeExe: "c:\\games\\game.exe",
+    safetyEpoch: 0,
+    runtimeRevision: 200,
+  });
+  check("T9 auto-switch after emergency dropped", useAppStore.getState().profileId === "default");
+}
+
+// T9d: rule CRUD store actions drive the real invoke layer and refresh.
+{
+  const useAppStore = await freshStore();
+  __resetInvoke();
+  const rule = {
+    id: "r1",
+    executablePath: "C:\\Games\\game.exe",
+    profileId: "gaming",
+    enabled: true,
+    priority: 0,
+  };
+  let saved = null;
+  __mockInvoke("save_app_rule", (args) => {
+    saved = args.rule;
+    return { ...args.rule, id: "r1" };
+  });
+  __mockInvoke("get_app_state", () => snap({ appRules: [rule], runtimeRevision: 7 }));
+  await useAppStore.getState().saveAppRule(rule);
+  check("T9 save rule invokes backend", eq(saved, rule));
+  check("T9 save rule refreshes snapshot", eq(useAppStore.getState().appRules, [rule]));
+  __mockInvoke("get_app_state", () => snap({ appRules: [], runtimeRevision: 8 }));
+  __mockInvoke("delete_app_rule", () => undefined);
+  await useAppStore.getState().removeAppRule("r1");
+  check("T9 delete rule refreshes snapshot", eq(useAppStore.getState().appRules, []));
 }
 
 console.log(`\n${passed} assertions passed`);

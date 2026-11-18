@@ -1,5 +1,13 @@
 import { create } from "zustand";
-import type { AppSnapshot, EmergencyPayload, Profile } from "../types/keyboard";
+import type {
+  AppProfileStatus,
+  AppRule,
+  AppSnapshot,
+  AutoSwitchedPayload,
+  EmergencyPayload,
+  MatchReason,
+  Profile,
+} from "../types/keyboard";
 import * as api from "../lib/tauri";
 import { detectLocale, parseLocale, type Locale } from "../i18n";
 import { applyTheme, parseTheme, readStoredTheme, type Theme } from "../lib/theme";
@@ -60,6 +68,18 @@ interface AppStore {
   persistError: string | null;
   persistErrorKind: string | null;
   configRevision: number;
+  /** S5: why the effective profile is active. */
+  matchReason: MatchReason;
+  /** S5: automation paused after an emergency until an explicit resume. */
+  autoProfilePaused: boolean;
+  /** S5: the manual selection, if any. Null when automation decides. */
+  manualOverride: string | null;
+  /** S5: normalized exe of the current foreground app, if known. */
+  activeExe: string | null;
+  /** S5: persisted app rules. */
+  appRules: AppRule[];
+  /** S5: master switch for automatic profile switching. */
+  autoProfileEnabled: boolean;
   hydrate: () => Promise<void>;
   applySnapshot: (snapshot: AppSnapshot) => void;
   /**
@@ -75,6 +95,12 @@ interface AppStore {
    * they can never overwrite newer (e.g. post-emergency) state.
    */
   applyNativeEvent: (partial: Partial<AppStore>, epoch: number, rev: number) => void;
+  /**
+   * S5: apply a foreground auto-switch event through the same ordering
+   * gate. A late auto-switch can never overwrite newer (manual or
+   * post-emergency) state.
+   */
+  applyAutoSwitched: (payload: AutoSwitchedPayload) => void;
   toggleKey: (code: string) => Promise<void>;
   enableAll: () => Promise<void>;
   chooseLayout: (id: string) => Promise<void>;
@@ -84,6 +110,15 @@ interface AppStore {
   renameCurrent: (name: string) => Promise<void>;
   removeProfile: (id: string) => Promise<void>;
   resetCurrent: () => Promise<void>;
+  /** S5: create or update one app rule. */
+  saveAppRule: (rule: AppRule) => Promise<void>;
+  /** S5: delete one app rule. */
+  removeAppRule: (id: string) => Promise<void>;
+  /** S5: master switch for automatic profile switching. */
+  setAutoProfileEnabled: (enabled: boolean) => Promise<void>;
+  /** S5: clear the manual override and the safety pause, re-evaluating
+   * the current foreground app. */
+  resumeAuto: () => Promise<void>;
   markOnboarded: (layoutId: string) => Promise<void>;
   setAutostart: (enabled: boolean) => Promise<void>;
   setLocale: (locale: Locale) => Promise<void>;
@@ -122,6 +157,12 @@ function apply(snapshot: AppSnapshot): Partial<AppStore> | null {
     persistError: snapshot.persistError,
     persistErrorKind: snapshot.persistErrorKind,
     configRevision: snapshot.configRevision,
+    matchReason: snapshot.matchReason,
+    autoProfilePaused: snapshot.autoProfilePaused,
+    manualOverride: snapshot.manualOverride,
+    activeExe: snapshot.activeExe,
+    appRules: snapshot.appRules,
+    autoProfileEnabled: snapshot.autoProfileEnabled,
   };
 }
 
@@ -197,6 +238,12 @@ export const useAppStore = create<AppStore>((set, get) => {
   persistError: null,
   persistErrorKind: null,
   configRevision: 0,
+  matchReason: "default",
+  autoProfilePaused: false,
+  manualOverride: null,
+  activeExe: null,
+  appRules: [],
+  autoProfileEnabled: true,
 
   applySnapshot: (snapshot) => {
     const next = apply(snapshot);
@@ -211,6 +258,17 @@ export const useAppStore = create<AppStore>((set, get) => {
     if (!isFreshStamp(epoch, rev)) return;
     markAppliedStamp(epoch, rev);
     set(partial);
+  },
+  applyAutoSwitched: (payload) => {
+    get().applyNativeEvent(
+      {
+        profileId: payload.profileId,
+        matchReason: payload.matchReason,
+        activeExe: payload.activeExe,
+      },
+      payload.safetyEpoch,
+      payload.runtimeRevision,
+    );
   },
   hydrate: async () => {
     const snapshot = await api.getAppState();
@@ -398,6 +456,81 @@ export const useAppStore = create<AppStore>((set, get) => {
       if (!isCurrentCommand(rev)) return;
       // P3: the post-command pull is stamped; drop it if newer state
       // (event/snapshot) was applied while awaiting.
+      const next = apply(snapshot);
+      if (next) set(next);
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      await fail(err);
+    }
+  },
+
+  saveAppRule: async (rule) => {
+    const rev = beginCommand();
+    try {
+      await api.saveAppRule(rule);
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
+      const next = apply(snapshot);
+      if (next) set(next);
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      await fail(err);
+    }
+  },
+
+  removeAppRule: async (id) => {
+    const rev = beginCommand();
+    try {
+      await api.deleteAppRule(id);
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
+      const next = apply(snapshot);
+      if (next) set(next);
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      await fail(err);
+    }
+  },
+
+  setAutoProfileEnabled: async (enabled) => {
+    const rev = beginCommand();
+    const prev = get().autoProfileEnabled;
+    set({ autoProfileEnabled: enabled });
+    try {
+      await api.setAutoProfileEnabled(enabled);
+      if (!isCurrentCommand(rev)) return;
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
+      const next = apply(snapshot);
+      if (next) set(next);
+    } catch (err) {
+      if (!isCurrentCommand(rev)) return;
+      set({ autoProfileEnabled: prev });
+      await fail(err);
+    }
+  },
+
+  resumeAuto: async () => {
+    const rev = beginCommand();
+    try {
+      const status: AppProfileStatus = await api.resumeAutoProfile();
+      if (!isCurrentCommand(rev)) return;
+      get().applyNativeEvent(
+        {
+          profileId: status.activeProfileId,
+          matchReason: status.matchReason,
+          manualOverride: status.manualOverride,
+          autoProfilePaused: status.safetyPaused,
+          activeExe: status.currentExe,
+          error: null,
+        },
+        status.safetyEpoch,
+        status.runtimeRevision,
+      );
+      // The resume may have switched the effective profile; pull the
+      // authoritative snapshot so disabled keys follow it.
+      const snapshot = await api.getAppState();
+      if (!isCurrentCommand(rev)) return;
       const next = apply(snapshot);
       if (next) set(next);
     } catch (err) {

@@ -10,6 +10,7 @@ use commands::*;
 use keyboard::hook::HookEvent;
 use keyboard::hook_lifecycle::HookExit;
 use keyboard::SafetyState;
+use platform::foreground::spawn_foreground_observer;
 use platform::start_input_backend;
 use state::AppState;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -293,6 +294,12 @@ pub fn run() {
             rename_profile,
             delete_profile,
             reset_profile,
+            get_app_rules,
+            save_app_rule,
+            delete_app_rule,
+            set_auto_profile_enabled,
+            resume_auto_profile,
+            get_app_profile_status,
             retry_persist,
             get_pressed_snapshot,
         ])
@@ -337,6 +344,11 @@ pub fn run() {
                 persist_error: parking_lot::Mutex::new(None),
                 persist_error_kind: parking_lot::Mutex::new(None),
                 runtime_revision: AtomicU64::new(0),
+                app_profiles: parking_lot::Mutex::new(
+                    crate::profiles::app_profiles::AppProfileRuntime::new(
+                        crate::profiles::DEFAULT_PROFILE_ID,
+                    ),
+                ),
             });
 
             spawn_event_pump(app.handle().clone(), backend.events);
@@ -348,6 +360,9 @@ pub fn run() {
             if let Some(exit_rx) = backend.hook_exit {
                 spawn_hook_watcher(app.handle().clone(), exit_rx);
             }
+            // S5: the foreground observer runs on its own thread, away
+            // from the hook callback. No-op off Windows.
+            spawn_foreground_observer(app.handle().clone());
             tray::setup(app.handle())?;
 
             if let Some(window) = app.get_webview_window("main") {

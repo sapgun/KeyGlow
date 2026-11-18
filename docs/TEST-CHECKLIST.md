@@ -299,3 +299,55 @@ Physical (needs the rig):
 4. Windows silently removing the hook while the thread lives is NOT
    detectable from userspace (documented limitation): if keys stop being
    filtered while the UI still shows active, restart the app from the tray.
+
+## Test 21 — Per-app profiles (S5)
+
+Automated (pure-logic tests in `src-tauri/src/profiles/app_profiles.rs`,
+15 tests, deterministic with a virtual clock — no sleeps; S5 integration
+tests in `state.rs`, 5 tests; frontend contract in
+`scripts/test-store-contract.mjs`, T9, 12 assertions):
+
+- Notepad → browser → game fast switching: only the app still in front
+  after the 200ms debounce commits; intermediate apps never become
+  effective.
+- Rapid Alt+Tab flurry: the debounce timer restarts on every change, so
+  only the final app switches.
+- App exit / unknown foreground: resolves to no match → Default fallback.
+- Inaccessible process (query failure): same Default fallback, no error
+  state.
+- Manual override survives foreground changes; resume clears the override
+  and the safety pause and re-evaluates the current app immediately.
+- Deleting a profile removes the rules that reference it and falls the
+  effective profile back to Default.
+- Saving a rule that points at a non-existent profile is rejected.
+- Duplicate rules: highest priority wins; ties go to the first rule in
+  the list; exact duplicates collapse at normalize time.
+- Emergency unlock pauses automation on Default; foreground changes do
+  not resume it until an explicit `resume_auto_profile`.
+- Cat Lock survives foreground switches (the lock flag is never touched
+  by a switch).
+- Foreground switches never write `settings.json` (state test asserts
+  the file bytes are unchanged) and never change `selected_profile`.
+- Frontend: the snapshot carries the S5 fields; the `profile:auto-switched`
+  event applies through the P3 ordering gate (stale switches dropped, an
+  emergency floors the stamp); malformed auto-switch payloads are ignored;
+  rule CRUD drives the real invoke layer and refreshes the snapshot.
+
+Physical (needs the rig):
+
+1. Open Notepad, then Alt+Tab to the browser, then to a game, pausing
+   less than 200ms on each. Expected: only the game's profile becomes
+   effective; the browser's profile never flashes in.
+2. With a rule for the game exe, Alt+Tab to the game and type. Expected:
+   the game profile's disabled keys apply; switching back to Notepad
+   restores Default within ~250ms.
+3. Pick a profile manually, then Alt+Tab between apps. Expected: the
+   manual profile stays effective regardless of the foreground app.
+4. Trigger the emergency unlock while a game rule is active, then Alt+Tab
+   to the game. Expected: Default stays effective and the UI offers
+   "Resume automatic switching"; the game profile does not come back
+   until Resume is pressed.
+5. Enable Cat Lock, then Alt+Tab to the game. Expected: all keys stay
+   blocked; the lock is not lifted by the switch.
+6. Close the game while its profile is effective. Expected: Default
+   returns; no error banner appears.

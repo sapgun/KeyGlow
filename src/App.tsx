@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { Keyboard } from "./components/Keyboard/Keyboard";
+import { AppRulesPanel } from "./components/AppRulesPanel";
 import { LayoutSelector } from "./components/LayoutSelector";
 import { Onboarding } from "./components/Onboarding";
 import { ProfileSelector } from "./components/ProfileSelector";
@@ -90,6 +91,10 @@ export default function App() {
         api.onHookStatusChanged((payload) =>
           useAppStore.getState().setHookStatus(payload.hookActive, payload.hookError),
         ),
+        // S5: the foreground observer switched the effective profile —
+        // apply through the P3 ordering gate so a late switch can never
+        // overwrite newer (manual or post-emergency) state.
+        api.onAutoSwitched((payload) => useAppStore.getState().applyAutoSwitched(payload)),
       ]);
       const fns: Array<() => void> = [];
       let failure: unknown = null;
@@ -245,6 +250,20 @@ export default function App() {
             />
           </div>
         </section>
+
+        <AppRulesPanel
+          rules={store.appRules}
+          profiles={store.profiles}
+          autoEnabled={store.autoProfileEnabled}
+          paused={store.autoProfilePaused}
+          matchReason={store.matchReason}
+          activeExe={store.activeExe}
+          activeProfileId={store.profileId}
+          onSave={store.saveAppRule}
+          onDelete={store.removeAppRule}
+          onToggleAuto={store.setAutoProfileEnabled}
+          onResume={store.resumeAuto}
+        />
 
         <div className="mt-3 flex flex-shrink-0 flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-5 text-xs text-muted">
