@@ -484,6 +484,39 @@ Decisions and why:
   `scripts/validate-layouts.mjs` fails if any ANSI file's bytes
   change; the hashes are updated only deliberately, after review.
 
+## ADR: device identification research (S7)
+
+Research only; no product code. Full findings in
+`docs/DEVICE-RESEARCH.md`. Conclusions:
+
+- **Identification is feasible; blocking is not, via Raw Input.**
+  `GetRawInputDeviceList` + `GetRawInputDeviceInfo` enumerate
+  keyboards with stable interface-path identities and VID/PID;
+  friendly names come from SetupAPI or the HID API. A keyboard
+  TLC registration (`0x01`/`0x06`, `RIDEV_INPUTSINK |
+  RIDEV_DEVNOTIFY`) delivers per-device `WM_INPUT` in the
+  background, with hotplug via `WM_INPUT_DEVICE_CHANGE`.
+- **Raw Input cannot block input.** `RIDEV_NOLEGACY` only
+  suppresses legacy messages for the registering app's own
+  windows. Per-device blocking needs either a hook + Raw Input
+  correlation heuristic (best-effort, racy, unproven — a
+  hook-consumed key may never produce a `WM_INPUT`) or a kernel
+  filter driver (robust, but driver install + signing + admin,
+  against the project's no-driver premise). Do not promise
+  per-device blocking; the S8 ADR must decide.
+- **Integration shape, when an observer is built:** a dedicated
+  invisible window on its own thread (the hook thread has no
+  window, so `WM_INPUT` cannot go there), observation only,
+  no touch on `SafetyState`, no `convergence_lock()`, no work
+  added to the hook callback. Device attribution reaching the
+  UI must carry the P3 `(safetyEpoch, runtimeRevision)` stamp
+  and pass the ordering gate.
+- **Caveats:** phantom keyboards pollute enumeration (filter to
+  devices that actually produced input); `hDevice` values are
+  not stable identities; nothing in the device info says ISO
+  vs JIS; friendly names are best-effort with a manual-override
+  fallback.
+
 Detection limits (documented honestly, not claimed otherwise):
 
 - `IntlYen`'s VK_OEM_5 is provisional (AHK documents vkDCsc07D).

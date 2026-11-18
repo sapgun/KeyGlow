@@ -413,3 +413,60 @@ Physical (needs the rig + real ISO/JIS keyboards):
 8. Delete an imported layout that no profile uses. Expected: it
    disappears from the selector. Try to delete one a profile uses.
    Expected: the backend refuses and the layout stays.
+
+## Test 23 — Device identification via Raw Input (S7)
+
+Research only so far (`docs/DEVICE-RESEARCH.md`): no observer code
+exists yet. The automated checks below apply once an observer is
+built; the physical checks settle the open questions in the research
+doc. Nothing here is verified yet.
+
+Automated (once the observer exists):
+
+- `GetRawInputDeviceList` enumeration matches the devices the
+  observer reports; every reported keyboard has a stable identity
+  (device interface path, never the raw `hDevice` value).
+- Registering the keyboard TLC (usage page 0x01, usage 0x06) with
+  `RIDEV_INPUTSINK | RIDEV_DEVNOTIFY` delivers `WM_INPUT` while
+  another app is in the foreground.
+- Each `WM_INPUT` maps through `identify_key` to the same `KeyCode`
+  the hook reports for the same physical press, including the S6
+  scan-code disambiguation.
+- `WM_INPUT_DEVICE_CHANGE` fires on plug and unplug; the device
+  list refreshes without restart.
+- The observer never touches `SafetyState`, never holds
+  `convergence_lock()`, and never writes `settings.json`.
+  The hook callback is unchanged (no disk/network/UI/blocking
+  send added).
+
+Physical (needs the rig + two keyboards):
+
+1. Plug in two keyboards. Expected: the observer lists both, each
+   with a distinct identity (interface path / VID/PID); phantom
+   entries (embedded controller, remote-desktop virtual keyboard)
+   are filtered or clearly marked, not presented as real keyboards.
+2. Press keys on keyboard A, then keyboard B. Expected: the
+   observer attributes each press to the right device.
+3. Check friendly names. Expected: each keyboard shows its real
+   product/manufacturer name, or a VID/PID fallback where the
+   device reports none. No admin prompt appears.
+4. Unplug keyboard B while typing on keyboard A, then plug B back
+   in. Expected: a device-change event fires, B disappears and
+   reappears with the same stored identity (interface path), and
+   attribution keeps working without restarting the app.
+5. Disable a key in KeyGlow, then press it on either keyboard.
+   Expected: the key is blocked as before. Record whether a
+   `WM_INPUT` arrives for the blocked press at all. This settles
+   whether hook + Raw Input correlation is even possible (research
+   doc §3.1); if no `WM_INPUT` arrives for blocked keys,
+   correlation cannot identify blocked keys.
+6. Press the same key on both keyboards within ~50 ms of each
+   other. Expected: record whether the observer can still tell
+   the two presses apart, or whether they collide. This bounds
+   how reliable timestamp correlation could ever be.
+7. Minimise the app to the tray, switch to another app, and type.
+   Expected: the observer still attributes input while in the
+   background.
+8. Sleep/resume the machine with both keyboards attached.
+   Expected: enumeration and attribution resume without restart,
+   and stored device identities are still valid.

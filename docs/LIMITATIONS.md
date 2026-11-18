@@ -16,7 +16,7 @@ A low-level keyboard hook (`WH_KEYBOARD_LL`) works for the current Windows sessi
 | Other SAS / secure-desktop input | Same reason. |
 | `Fn` | Almost always handled inside keyboard firmware. Windows never sees a standalone Fn virtual key. The key is shown on compact layouts as **unsupported**. |
 | Some vendor extra keys / media keys | Often HID consumer-page usages rather than standard VK codes. Deferred. |
-| Per-device filtering | `WH_KEYBOARD_LL` is session-global. KeyGlow does **not** claim per-keyboard control in v0.1. Raw Input could be added later. |
+| Per-device filtering | `WH_KEYBOARD_LL` is session-global and carries no device handle. Raw Input identifies which keyboard produced input, but it cannot block input (see `docs/DEVICE-RESEARCH.md`): per-device filtering would need a separate blocking mechanism — a hook + Raw Input correlation heuristic (best-effort, unproven) or a kernel filter driver (out of scope for the no-driver premise). KeyGlow does **not** claim per-keyboard control in v0.1. |
 
 ## Global, not per keyboard
 
@@ -40,7 +40,7 @@ The keyboard hook is installed once at startup and removed at exit. Restarting t
 
 ## Next recommended improvements
 
-1. Per-device filtering via Raw Input (`GetRawInputDeviceList` + device handle on `RAWINPUT`)
+1. Per-device identification via Raw Input (`GetRawInputDeviceList` + device handle on `RAWINPUT`) — observation only; per-device *filtering* is a separate problem Raw Input cannot solve, see `docs/DEVICE-RESEARCH.md`
 2. ISO / JIS / HHKB / Alice layout packs
 3. Optional key remapping (in addition to enable/disable)
 4. Per-application profiles
