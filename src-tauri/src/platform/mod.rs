@@ -8,6 +8,8 @@ use std::sync::Arc;
 #[cfg(windows)]
 mod windows;
 
+pub mod foreground;
+
 pub struct ControllerStart {
     pub controller: Arc<dyn KeyboardController>,
     pub events: Receiver<HookEvent>,

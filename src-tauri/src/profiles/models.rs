@@ -1,4 +1,5 @@
 use crate::keyboard::KeyCode;
+use crate::profiles::app_profiles::{dedupe_rules, normalize_executable_path, AppRule};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -47,6 +48,12 @@ pub struct AppConfig {
     pub theme: String,
     #[serde(default)]
     pub profiles: Vec<Profile>,
+    /// App rules (S5): foreground executable -> profile. Persisted.
+    #[serde(default)]
+    pub app_rules: Vec<AppRule>,
+    /// Master switch for automatic profile switching (S5). Persisted.
+    #[serde(default = "default_true")]
+    pub auto_profile_enabled: bool,
     /// Runtime-only: the file was written by a newer KeyGlow. Never
     /// serialized back and never overwritten by `save` (see
     /// `AppState::persist`): non-destructive fallback, read-only mode.
@@ -59,6 +66,9 @@ pub struct AppConfig {
 
 fn default_version() -> u32 {
     CONFIG_VERSION
+}
+fn default_true() -> bool {
+    true
 }
 fn default_layout() -> String {
     DEFAULT_LAYOUT.to_string()
@@ -81,6 +91,8 @@ impl Default for AppConfig {
             locale: String::new(),
             theme: "dark".to_string(),
             profiles: builtin_profiles(),
+            app_rules: vec![],
+            auto_profile_enabled: true,
             future_version: false,
             loaded_version: CONFIG_VERSION,
         }
@@ -188,6 +200,25 @@ impl AppConfig {
                 self.selected_profile
             );
             self.selected_profile = DEFAULT_PROFILE_ID.to_string();
+        }
+        // S5: app rules must point at existing profiles and have a
+        // non-empty executable path; drop the invalid ones (same
+        // philosophy as unknown key ids above) and drop exact duplicates.
+        let before_rules = self.app_rules.len();
+        self.app_rules.retain(|r| {
+            let ok = !normalize_executable_path(&r.executable_path).is_empty()
+                && self.profiles.iter().any(|p| p.id == r.profile_id);
+            if !ok {
+                tracing::warn!(
+                    "app rule {} has an unknown profile or empty path; removed",
+                    r.id
+                );
+            }
+            ok
+        });
+        self.app_rules = dedupe_rules(&self.app_rules);
+        if self.app_rules.len() != before_rules {
+            tracing::warn!("app rules cleaned during normalize");
         }
         // Activation invariant: selected_layout always follows the selected
         // profile's layout.

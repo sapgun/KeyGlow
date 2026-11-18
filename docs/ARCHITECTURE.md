@@ -367,3 +367,66 @@ Detection limits (documented honestly, not claimed otherwise):
   then relaunch); the emergency shortcut itself depends on the hook, so a
   silently-removed hook also disables emergency unlock until restart. This
   is a platform limitation, not something a userspace watchdog can fix.
+
+## ADR: per-app profiles (S5)
+
+The foreground observer (`platform/foreground.rs`) and the rule resolver
+(`profiles/app_profiles.rs`) switch the effective profile when the
+foreground app changes. The hook callback is untouched: it never looks up
+a process or evaluates a rule. The observer runs on its own thread and the
+resolver is pure logic; only the outcome (which profile is effective) is
+applied to the engine.
+
+Decisions and why:
+
+- **Polling, not a WinEventHook.** The observer polls
+  `GetForegroundWindow` every 50ms and debounces 200ms before committing
+  a change. A `WinEventHook` callback would run on a system thread and
+  need the same debounce plus cross-thread delivery anyway; polling keeps
+  the whole path on one thread we own, and a missed poll costs at most
+  50ms. The debounce (not the poll) is what stops Alt+Tab flurries from
+  thrashing profiles: only the app still in front after 200ms wins.
+- **Match on the exe path only, never the window title.** Titles change
+  with the open document and are user-controlled text; the normalized exe
+  path (lowercased, `/` → `\`, trimmed) is stable. A rule stores the full
+  path as typed; matching compares normalized forms, so
+  `C:/Games/Game.EXE` and `c:\games\game.exe` are the same rule.
+- **Effective profile is runtime-only; `selected_profile` is the manual
+  choice.** Foreground switches change only the controller key state and
+  the in-memory runtime; `settings.json` is never written for a switch
+  (a state test asserts the file bytes are unchanged). The persisted
+  `selected_profile` keeps its meaning: what the user picked by hand.
+- **Priority: Cat Lock > safety pause > manual > app rule > Default.**
+  Cat Lock is engine-level and no switch can clear it. After an
+  emergency unlock the runtime is paused on Default until the user
+  explicitly resumes — a foreground change must never silently undo an
+  emergency. A manual selection beats any rule and survives foreground
+  changes; only `resume_auto_profile` clears both the manual override and
+  the pause, then re-evaluates the current app immediately.
+- **Duplicate rules: highest priority wins; ties go to the first rule in
+  the list.** An exact duplicate (same exe + same profile + same enabled
+  state) is collapsed to the first entry at normalize time, so the stored
+  list never carries dead copies.
+- **Validation at the boundary.** Saving a rule that points at a profile
+  that does not exist is rejected; deleting a profile removes the rules
+  that reference it. An unknown, inaccessible, or exited foreground
+  process resolves to no match, which falls back to Default — never to an
+  error state, and never to the previous app's profile.
+- **UI propagation follows the P3 contract.** The snapshot's `profile_id`
+  is the effective profile and carries `matchReason`,
+  `autoProfilePaused`, `manualOverride`, `activeExe`, `appRules`, and
+  `autoProfileEnabled`. A switch also emits `profile:auto-switched` with
+  the P3 stamp (`safetyEpoch`, `runtimeRevision`); the store applies it
+  through the same ordering gate as every other native event, so a late
+  switch can never overwrite newer manual or post-emergency state.
+
+Detection limits (documented honestly, not claimed otherwise):
+
+- The observer sees only the foreground *window's* process. A process
+  that spawns a helper exe in front (e.g. a launcher handing off to a
+  game exe) switches on the helper until the game window takes focus;
+  that is the correct behavior for "the app in front", not a bug.
+- `QueryFullProcessImageNameW` can fail for protected processes; those
+  fall back to Default. There is no userspace way to identify such a
+  process's exe reliably, and guessing from the window title is
+  explicitly out of scope.

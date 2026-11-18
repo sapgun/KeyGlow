@@ -1,4 +1,5 @@
 use crate::keyboard::KeyCode;
+use crate::profiles::app_profiles::{AppRule, EffectiveChange, MatchReason};
 use crate::profiles::models::VALID_LAYOUT_IDS;
 use crate::state::AppState;
 use serde::Serialize;
@@ -11,6 +12,9 @@ pub struct AppSnapshot {
     pub hook_active: bool,
     pub hook_error: Option<String>,
     pub layout_id: String,
+    /// Effective profile (S5): the profile actually filtering keys now.
+    /// It may differ from the persisted manual selection when an app
+    /// rule matched; `match_reason` says why.
     pub profile_id: String,
     pub profiles: Vec<crate::profiles::Profile>,
     pub disabled_keys: Vec<String>,
@@ -37,6 +41,18 @@ pub struct AppSnapshot {
     /// `config_revision`: this orders runtime state, that one orders disk
     /// writes. Never compare the two against each other.
     pub runtime_revision: u64,
+    /// Why the effective profile is active (S5).
+    pub match_reason: MatchReason,
+    /// Automation paused after an emergency until an explicit resume (S5).
+    pub auto_profile_paused: bool,
+    /// The manual selection, if any (S5). Null when automation decides.
+    pub manual_override: Option<String>,
+    /// Normalized exe of the current foreground app, if known (S5).
+    pub active_exe: Option<String>,
+    /// Persisted app rules (S5).
+    pub app_rules: Vec<AppRule>,
+    /// Master switch for automatic profile switching (S5).
+    pub auto_profile_enabled: bool,
 }
 
 /// Ordering envelope for state-affecting native events (P3). The UI applies
@@ -68,6 +84,34 @@ pub struct CatLockPayload {
 pub struct EmergencyPayload {
     pub epoch: u64,
     pub runtime_revision: u64,
+}
+
+/// Emitted when the foreground observer switches the effective profile
+/// (S5). Carries the P3 ordering stamp so the UI gates it like any other
+/// native state event: a late auto-switch can never overwrite newer
+/// (e.g. post-emergency or manual) state.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoSwitchedPayload {
+    pub profile_id: String,
+    pub match_reason: MatchReason,
+    pub active_exe: Option<String>,
+    pub safety_epoch: u64,
+    pub runtime_revision: u64,
+}
+
+pub(crate) fn auto_switched_payload(
+    state: &AppState,
+    change: &EffectiveChange,
+) -> AutoSwitchedPayload {
+    let (safety_epoch, runtime_revision) = state.event_stamp();
+    AutoSwitchedPayload {
+        profile_id: change.profile_id.clone(),
+        match_reason: change.reason,
+        active_exe: change.exe.clone(),
+        safety_epoch,
+        runtime_revision,
+    }
 }
 
 /// Health of the keyboard hook thread (HF-07). Emitted as
@@ -103,11 +147,12 @@ fn cat_lock_payload(state: &AppState, locked: bool) -> CatLockPayload {
 pub fn get_app_state(state: State<AppState>) -> AppSnapshot {
     let cfg = state.config.lock().clone();
     let (persisted, persist_error, persist_error_kind, config_revision) = state.persist_state();
+    let (effective, manual, reason, paused, active_exe, _) = state.app_profile_status();
     AppSnapshot {
         hook_active: state.is_hook_active(),
         hook_error: state.hook_error(),
         layout_id: cfg.selected_layout,
-        profile_id: cfg.selected_profile,
+        profile_id: effective,
         profiles: cfg.profiles,
         disabled_keys: state.snapshot_disabled(),
         onboarded: cfg.onboarded,
@@ -124,6 +169,12 @@ pub fn get_app_state(state: State<AppState>) -> AppSnapshot {
         safety_epoch: state.safety.epoch(),
         safety_reconciled: state.safety.reconciled_epoch(),
         runtime_revision: state.runtime_revision.load(Ordering::SeqCst),
+        match_reason: reason,
+        auto_profile_paused: paused,
+        manual_override: manual,
+        active_exe,
+        app_rules: cfg.app_rules,
+        auto_profile_enabled: cfg.auto_profile_enabled,
     }
 }
 
@@ -149,8 +200,12 @@ pub fn set_key_enabled(
     }
 
     {
+        // S5: key edits target the *effective* profile — the one actually
+        // filtering keys — which may be an app-rule match rather than the
+        // persisted manual selection.
+        let effective = state.effective_profile_id();
         let mut cfg = state.config.lock();
-        if let Some(profile) = cfg.current_profile_mut() {
+        if let Some(profile) = cfg.profile_mut(&effective) {
             profile.disabled_keys.retain(|k| k != &code);
             if !enabled {
                 profile.disabled_keys.push(code.clone());
@@ -182,8 +237,11 @@ pub fn enable_all_keys(app: AppHandle, state: State<AppState>) -> Result<StateCh
     let entered = state.safety_epoch();
     state.controller.enable_all();
     {
+        // S5: clear the *effective* profile's disabled set (see
+        // set_key_enabled).
+        let effective = state.effective_profile_id();
         let mut cfg = state.config.lock();
-        if let Some(profile) = cfg.current_profile_mut() {
+        if let Some(profile) = cfg.profile_mut(&effective) {
             profile.disabled_keys.clear();
         }
     }

@@ -1,7 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AppProfileStatus,
+  AppRule,
   AppSnapshot,
+  AutoSwitchedPayload,
   CatLockPayload,
   EmergencyPayload,
   HookStatusPayload,
@@ -58,6 +61,31 @@ export function deleteProfile(id: string) {
 
 export function resetProfile(id: string) {
   return invoke<Profile>("reset_profile", { id });
+}
+
+// S5: app-profile rules and automation control.
+export function getAppRules() {
+  return invoke<AppRule[]>("get_app_rules");
+}
+
+export function getAppProfileStatus() {
+  return invoke<AppProfileStatus>("get_app_profile_status");
+}
+
+export function saveAppRule(rule: AppRule) {
+  return invoke<AppRule>("save_app_rule", { rule });
+}
+
+export function deleteAppRule(id: string) {
+  return invoke<void>("delete_app_rule", { id });
+}
+
+export function setAutoProfileEnabled(enabled: boolean) {
+  return invoke<boolean>("set_auto_profile_enabled", { enabled });
+}
+
+export function resumeAutoProfile() {
+  return invoke<AppProfileStatus>("resume_auto_profile");
 }
 
 export function retryPersist() {
@@ -201,6 +229,31 @@ function payloadHookStatus(payload: unknown): HookStatusPayload | null {
   return null;
 }
 
+function payloadAutoSwitched(payload: unknown): AutoSwitchedPayload | null {
+  if (payload && typeof payload === "object" && "profileId" in payload) {
+    const p = payload as Partial<AutoSwitchedPayload>;
+    if (
+      typeof p.profileId === "string" &&
+      (p.matchReason === "manual" ||
+        p.matchReason === "app-rule" ||
+        p.matchReason === "default" ||
+        p.matchReason === "safety-paused") &&
+      (typeof p.activeExe === "string" || p.activeExe === null) &&
+      typeof p.safetyEpoch === "number" &&
+      typeof p.runtimeRevision === "number"
+    ) {
+      return {
+        profileId: p.profileId,
+        matchReason: p.matchReason,
+        activeExe: p.activeExe ?? null,
+        safetyEpoch: p.safetyEpoch,
+        runtimeRevision: p.runtimeRevision,
+      };
+    }
+  }
+  return null;
+}
+
 export function onHookStatusChanged(
   handler: (payload: HookStatusPayload) => void,
 ): Promise<UnlistenFn> {
@@ -208,6 +261,17 @@ export function onHookStatusChanged(
     const payload = payloadHookStatus(event.payload);
     // The backend only emits this when the hook thread died on its own;
     // a missing payload means a protocol mismatch and is dropped.
+    if (payload) handler(payload);
+  });
+}
+
+export function onAutoSwitched(
+  handler: (payload: AutoSwitchedPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<unknown>("profile:auto-switched", (event) => {
+    const payload = payloadAutoSwitched(event.payload);
+    // The backend only emits this when the observer switched the
+    // effective profile; a malformed payload is dropped.
     if (payload) handler(payload);
   });
 }

@@ -1,5 +1,8 @@
 use crate::keyboard::engine::KeyboardController;
 use crate::keyboard::{KeyCode, SafetyState};
+use crate::profiles::app_profiles::{
+    AppProfileRuntime, AppRule, EffectiveChange, MatchReason,
+};
 use crate::profiles::{save, AppConfig, DEFAULT_PROFILE_ID};
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -40,6 +43,11 @@ pub struct AppState {
     pub persist_error: Mutex<Option<String>>,
     /// Machine-readable kind of the last failure (for translated UI).
     pub persist_error_kind: Mutex<Option<String>>,
+    /// Runtime-only app-profile state (S5): effective profile, manual
+    /// override, safety pause, match reason, foreground exe. Never
+    /// serialized, never written to disk. `config.selected_profile` stays
+    /// the manual selection; this holds what actually filters keys now.
+    pub app_profiles: Mutex<AppProfileRuntime>,
 }
 
 impl AppState {
@@ -147,6 +155,11 @@ impl AppState {
                 profile.disabled_keys.clear();
             }
         }
+        // S5: the emergency pauses automation and drops any manual
+        // override. The effective profile becomes Default with the
+        // safety-paused reason; no auto-switch can undo the unlock until
+        // the user explicitly resumes.
+        self.app_profiles.lock().on_emergency();
         // The runtime state changed (controller + config); order it for the
         // UI even though the persist below is best-effort (P3).
         self.bump_runtime_revision();
@@ -165,6 +178,136 @@ impl AppState {
     /// landed mid-command and the command must be discarded.
     pub fn safety_epoch(&self) -> u64 {
         self.safety.epoch()
+    }
+
+    // ---- S5: app profiles (runtime-only effective profile) ----
+
+    /// The profile actually filtering keys right now (may differ from
+    /// `config.selected_profile` when an app rule matched).
+    pub fn effective_profile_id(&self) -> String {
+        self.app_profiles.lock().effective_profile_id().to_string()
+    }
+
+    /// (effective, manual_override, reason, safety_paused, current_exe,
+    /// runtime revision) for the snapshot / status payload.
+    pub fn app_profile_status(
+        &self,
+    ) -> (String, Option<String>, MatchReason, bool, Option<String>, u64) {
+        let rt = self.app_profiles.lock();
+        (
+            rt.effective_profile_id().to_string(),
+            rt.manual_override().map(|s| s.to_string()),
+            rt.reason(),
+            rt.safety_paused(),
+            rt.current_exe().map(|s| s.to_string()),
+            rt.revision(),
+        )
+    }
+
+    /// Snapshot the persisted inputs the resolver needs, so the runtime
+    /// lock is never held across the config lock.
+    fn rules_snapshot(&self) -> (Vec<AppRule>, bool, Vec<String>) {
+        let cfg = self.config.lock();
+        (
+            cfg.app_rules.clone(),
+            cfg.auto_profile_enabled,
+            cfg.profiles.iter().map(|p| p.id.clone()).collect(),
+        )
+    }
+
+    /// Apply one profile's disabled keys to the controller. Runtime-only:
+    /// no config write, no disk write.
+    fn apply_profile_keys(&self, profile_id: &str) {
+        let keys = {
+            let cfg = self.config.lock();
+            cfg.profile(profile_id)
+                .map(|p| parse_key_ids(&p.disabled_keys))
+                .unwrap_or_default()
+        };
+        self.controller.set_disabled_keys(&keys);
+    }
+
+    /// Apply the current effective profile's keys (after a manual
+    /// selection, delete, or resume changed it).
+    pub fn apply_effective_profile_keys(&self) {
+        let id = self.effective_profile_id();
+        self.apply_profile_keys(&id);
+    }
+
+    /// Record a manual profile selection in the runtime: it outranks app
+    /// rules and survives foreground switches until an explicit resume.
+    /// Keys/revision are the caller's job (the profile commands already
+    /// bump and apply via `apply_current_profile`, which targets the same
+    /// profile). Returns the change, if the effective profile moved.
+    pub fn set_manual_override(&self, id: &str) -> Option<EffectiveChange> {
+        self.app_profiles.lock().set_manual(id)
+    }
+
+    /// Foreground observation (observer thread): debounce, then resolve
+    /// and apply. Returns the change, if the effective profile moved.
+    /// Never writes settings.json.
+    pub fn note_foreground(&self, exe: Option<String>, now_ms: u64) -> Option<EffectiveChange> {
+        let due = self.app_profiles.lock().note_foreground(exe, now_ms);
+        if !due {
+            return None;
+        }
+        let (rules, auto_enabled, valid_ids) = self.rules_snapshot();
+        let change = self
+            .app_profiles
+            .lock()
+            .commit(&rules, auto_enabled, &valid_ids);
+        if let Some(change) = &change {
+            self.apply_profile_keys(&change.profile_id);
+            self.bump_runtime_revision();
+        }
+        change
+    }
+
+    /// Re-evaluate the current foreground app now (rule saved/deleted,
+    /// automation toggled). Returns the change, if it moved.
+    pub fn reevaluate_foreground(&self) -> Option<EffectiveChange> {
+        let (rules, auto_enabled, valid_ids) = self.rules_snapshot();
+        let change = self
+            .app_profiles
+            .lock()
+            .force_reevaluate(&rules, auto_enabled, &valid_ids);
+        if let Some(change) = &change {
+            self.apply_profile_keys(&change.profile_id);
+            self.bump_runtime_revision();
+        }
+        change
+    }
+
+    /// User resumes automation: clears the manual override and the safety
+    /// pause, re-evaluates the current foreground app. Runtime-only.
+    pub fn resume_auto(&self) -> Option<EffectiveChange> {
+        let (rules, auto_enabled, valid_ids) = self.rules_snapshot();
+        let change = self
+            .app_profiles
+            .lock()
+            .resume_auto(&rules, auto_enabled, &valid_ids);
+        if let Some(change) = &change {
+            self.apply_profile_keys(&change.profile_id);
+            self.bump_runtime_revision();
+        }
+        change
+    }
+
+    /// A profile was deleted (rules already cleaned in config): if it was
+    /// the manual override or the effective profile, fall back.
+    pub fn sync_runtime_after_profile_delete(&self, deleted_id: &str) -> Option<EffectiveChange> {
+        let (rules, auto_enabled, valid_ids) = self.rules_snapshot();
+        let change = self.app_profiles.lock().on_profile_deleted(
+            deleted_id,
+            &rules,
+            auto_enabled,
+            &valid_ids,
+        );
+        if let Some(change) = &change {
+            self.apply_profile_keys(&change.profile_id);
+            self.bump_runtime_revision();
+        }
+        change
     }
 }
 
@@ -231,6 +374,7 @@ mod tests {
             runtime_revision: AtomicU64::new(0),
             persist_error: Mutex::new(None),
             persist_error_kind: Mutex::new(None),
+            app_profiles: Mutex::new(AppProfileRuntime::new(DEFAULT_PROFILE_ID)),
         }
     }
 
@@ -480,6 +624,146 @@ mod tests {
         // A trigger alone does not mutate runtime state: the stamp's
         // revision part only moves on bump_runtime_revision().
         assert_eq!(state.event_stamp(), (epoch, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- S5: app profiles ----
+
+    fn gaming_rule() -> AppRule {
+        AppRule {
+            id: "r-game".into(),
+            executable_path: "C:\\Games\\game.exe".into(),
+            profile_id: "gaming".into(),
+            enabled: true,
+            priority: 0,
+        }
+    }
+
+    fn add_gaming_rule(state: &AppState) {
+        state.config.lock().app_rules.push(gaming_rule());
+    }
+
+    #[test]
+    fn foreground_switch_applies_rule_without_writing_settings() {
+        let dir = unique_temp_path("s5_nodisk");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let state = test_state(path.clone());
+        state.persist().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        add_gaming_rule(&state);
+
+        // Debouncing: the first sighting starts the timer, no switch yet.
+        assert!(state
+            .note_foreground(Some("C:\\Games\\game.exe".into()), 0)
+            .is_none());
+        let change = state
+            .note_foreground(Some("C:\\Games\\game.exe".into()), 250)
+            .expect("settled switch must commit");
+        assert_eq!(change.profile_id, "gaming");
+        assert_eq!(change.reason, MatchReason::AppRule);
+        // The controller filters Gaming's keys (MetaLeft/Right disabled).
+        assert!(!state.controller.is_enabled(KeyCode::MetaLeft));
+        assert!(!state.controller.is_enabled(KeyCode::MetaRight));
+        // But the file is byte-identical: the switch never touched disk,
+        // and the persisted selection is untouched too.
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(state.config.lock().selected_profile, DEFAULT_PROFILE_ID);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreground_switch_keeps_cat_lock() {
+        let dir = unique_temp_path("s5_catlock");
+        let state = test_state(dir.join("settings.json"));
+        add_gaming_rule(&state);
+        state.controller.set_cat_lock(true);
+
+        state.note_foreground(Some("C:\\Games\\game.exe".into()), 0);
+        let change = state.note_foreground(Some("C:\\Games\\game.exe".into()), 250);
+        assert!(change.is_some());
+        // The lock survives the switch: every key stays blocked.
+        assert!(state.controller.is_cat_locked());
+        assert!(!state.controller.is_enabled(KeyCode::KeyA));
+        assert!(!state.controller.is_enabled(KeyCode::MetaLeft));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emergency_pauses_automation_and_resume_restores_rule() {
+        let dir = unique_temp_path("s5_pause");
+        let state = test_state(dir.join("settings.json"));
+        add_gaming_rule(&state);
+        state.note_foreground(Some("C:\\Games\\game.exe".into()), 0);
+        assert!(state
+            .note_foreground(Some("C:\\Games\\game.exe".into()), 250)
+            .is_some());
+        assert_eq!(state.effective_profile_id(), "gaming");
+
+        state.emergency_unlock();
+        let (eff, _, reason, paused, _, _) = state.app_profile_status();
+        assert_eq!(eff, "default");
+        assert_eq!(reason, MatchReason::SafetyPaused);
+        assert!(paused);
+        assert!(state.controller.is_enabled(KeyCode::MetaLeft));
+
+        // Foreground switches while paused change nothing.
+        state.note_foreground(Some("C:\\Windows\\notepad.exe".into()), 500);
+        assert!(state
+            .note_foreground(Some("C:\\Windows\\notepad.exe".into()), 800)
+            .is_none());
+        assert_eq!(state.effective_profile_id(), "default");
+
+        // Explicit resume re-evaluates the current foreground (Notepad has
+        // no rule): Default with the Default reason.
+        let change = state.resume_auto().expect("resume must report the change");
+        assert_eq!(change.profile_id, "default");
+        assert_eq!(change.reason, MatchReason::Default);
+        assert!(!state.app_profile_status().3);
+    }
+
+    #[test]
+    fn manual_selection_survives_foreground_switch_via_state() {
+        let dir = unique_temp_path("s5_manual");
+        let state = test_state(dir.join("settings.json"));
+        add_gaming_rule(&state);
+        state.set_manual_override("coding");
+        assert_eq!(state.effective_profile_id(), "coding");
+
+        state.note_foreground(Some("C:\\Games\\game.exe".into()), 0);
+        assert!(state
+            .note_foreground(Some("C:\\Games\\game.exe".into()), 250)
+            .is_none());
+        assert_eq!(state.effective_profile_id(), "coding");
+        let (_, manual, reason, _, _, _) = state.app_profile_status();
+        assert_eq!(manual.as_deref(), Some("coding"));
+        assert_eq!(reason, MatchReason::Manual);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_delete_sync_falls_back_effective() {
+        let dir = unique_temp_path("s5_delete");
+        let state = test_state(dir.join("settings.json"));
+        add_gaming_rule(&state);
+        state.note_foreground(Some("C:\\Games\\game.exe".into()), 0);
+        assert!(state
+            .note_foreground(Some("C:\\Games\\game.exe".into()), 250)
+            .is_some());
+        assert_eq!(state.effective_profile_id(), "gaming");
+
+        // Simulate delete_profile's config cleanup: profile + its rules go.
+        {
+            let mut cfg = state.config.lock();
+            cfg.profiles.retain(|p| p.id != "gaming");
+            cfg.app_rules.retain(|r| r.profile_id != "gaming");
+        }
+        let change = state
+            .sync_runtime_after_profile_delete("gaming")
+            .expect("effective profile deleted must fall back");
+        assert_eq!(change.profile_id, "default");
+        assert_eq!(change.reason, MatchReason::Default);
+        assert_eq!(state.effective_profile_id(), "default");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

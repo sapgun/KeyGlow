@@ -44,6 +44,31 @@ export interface Profile {
   builtin: boolean;
 }
 
+/** One app rule (S5): foreground exe -> profile. */
+export interface AppRule {
+  id: string;
+  executablePath: string;
+  profileId: string;
+  enabled: boolean;
+  priority: number;
+}
+
+/** Why the effective profile is active (S5). */
+export type MatchReason = "manual" | "app-rule" | "default" | "safety-paused";
+
+/** Runtime app-profile status (S5). */
+export interface AppProfileStatus {
+  activeProfileId: string;
+  manualOverride: string | null;
+  matchReason: MatchReason;
+  safetyPaused: boolean;
+  autoEnabled: boolean;
+  currentExe: string | null;
+  revision: number;
+  safetyEpoch: number;
+  runtimeRevision: number;
+}
+
 export interface PressedSnapshot {
   pressed: string[];
   sequence: number;
@@ -52,6 +77,7 @@ export interface PressedSnapshot {
 export interface AppSnapshot {  hookActive: boolean;
   hookError: string | null;
   layoutId: string;
+  /** Effective profile (S5): what actually filters keys now. */
   profileId: string;
   profiles: Profile[];
   disabledKeys: string[];
@@ -76,6 +102,18 @@ export interface AppSnapshot {  hookActive: boolean;
    * successful disk writes. Never compare the two against each other.
    */
   runtimeRevision: number;
+  /** Why the effective profile is active (S5). */
+  matchReason: MatchReason;
+  /** Automation paused after an emergency until an explicit resume (S5). */
+  autoProfilePaused: boolean;
+  /** The manual selection, if any (S5). Null when automation decides. */
+  manualOverride: string | null;
+  /** Normalized exe of the current foreground app, if known (S5). */
+  activeExe: string | null;
+  /** Persisted app rules (S5). */
+  appRules: AppRule[];
+  /** Master switch for automatic profile switching (S5). */
+  autoProfileEnabled: boolean;
 }
 
 /**
@@ -111,4 +149,13 @@ export interface HookStatusPayload {
 export interface KeyPressPayload {
   code: string;
   seq: number;
+}
+
+/** Foreground observer switched the effective profile (S5). */
+export interface AutoSwitchedPayload {
+  profileId: string;
+  matchReason: MatchReason;
+  activeExe: string | null;
+  safetyEpoch: number;
+  runtimeRevision: number;
 }
