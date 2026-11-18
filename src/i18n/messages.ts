@@ -38,6 +38,9 @@ const en = {
   pressHintIdle: "Press a key to light it up",
   pressing: "Pressed",
   lastInput: "Last key",
+  keyStale: "verifying hold",
+  eventSubscribeFailed:
+    "Could not subscribe to keyboard events. Live key display may not update; restart the app if keys stop lighting up.",
   hookActive: "Keyboard control active",
   hookUnavailable: "Keyboard control unavailable",
   keysDisabled: "{n} keys disabled",
@@ -121,6 +124,9 @@ const ko: Record<MessageKey, string> = {
   pressHintIdle: "키를 누르면 해당 칸이 밝아집니다",
   pressing: "누르는 중",
   lastInput: "마지막 입력",
+  keyStale: "누름 확인 중",
+  eventSubscribeFailed:
+    "키보드 이벤트를 구독하지 못했습니다. 실시간 키 표시가 갱신되지 않을 수 있습니다. 키가 더 이상 켜지지 않으면 앱을 다시 시작하세요.",
   hookActive: "키보드 제어 활성",
   hookUnavailable: "키보드 제어 불가",
   keysDisabled: "꺼진 키 {n}개",
@@ -202,6 +208,9 @@ const ja: Record<MessageKey, string> = {
   pressHintIdle: "キーを押すと、そのキーが光ります",
   pressing: "押下中",
   lastInput: "直前のキー",
+  keyStale: "押下を確認中",
+  eventSubscribeFailed:
+    "キーボードイベントを購読できませんでした。リアルタイムのキー表示が更新されない可能性があります。キーが光らなくなったらアプリを再起動してください。",
   hookActive: "キーボード制御 有効",
   hookUnavailable: "キーボード制御 不可",
   keysDisabled: "無効なキー {n}",

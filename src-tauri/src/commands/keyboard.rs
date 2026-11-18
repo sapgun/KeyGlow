@@ -222,3 +222,27 @@ pub fn apply_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
 pub fn show_main_window(app: AppHandle) {
     crate::show_main(&app);
 }
+
+/// Native pressed snapshot for UI resync (HF-04). Returns the keys the hook
+/// currently considers physically held plus a sequence number that bumps on
+/// every processed hook event. The UI uses it to verify long holds and to
+/// recover from dropped key-up events instead of guessing with a timer.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PressedSnapshot {
+    pub pressed: Vec<String>,
+    pub sequence: u64,
+}
+
+#[tauri::command]
+pub fn get_pressed_snapshot(state: State<AppState>) -> PressedSnapshot {
+    PressedSnapshot {
+        pressed: state
+            .controller
+            .pressed_keys()
+            .into_iter()
+            .map(|k| k.as_str().to_string())
+            .collect(),
+        sequence: state.controller.event_sequence(),
+    }
+}

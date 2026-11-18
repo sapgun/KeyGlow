@@ -35,6 +35,10 @@ pub struct FilterEngine {
     forwarded_down: [bool; KeyCode::COUNT],
     physical_down: [bool; KeyCode::COUNT],
     cat_lock: bool,
+    /// Bumps on every processed hook event. The UI uses it to detect that
+    /// the native pressed snapshot changed while it was not watching
+    /// (HF-04): a resync compares this sequence, not wall-clock time.
+    event_seq: u64,
 }
 
 impl Default for FilterEngine {
@@ -50,6 +54,7 @@ impl FilterEngine {
             forwarded_down: [false; KeyCode::COUNT],
             physical_down: [false; KeyCode::COUNT],
             cat_lock: false,
+            event_seq: 0,
         }
     }
 
@@ -96,6 +101,22 @@ impl FilterEngine {
             .collect()
     }
 
+    /// Native pressed snapshot for UI resync (HF-04): the keys the hook
+    /// currently considers physically held, independent of what the UI was
+    /// told through the (lossy) event channel.
+    pub fn pressed_keys(&self) -> Vec<KeyCode> {
+        KeyCode::ALL
+            .iter()
+            .copied()
+            .filter(|k| self.physical_down[k.index()])
+            .collect()
+    }
+
+    /// Sequence number of the last processed hook event (HF-04).
+    pub fn event_sequence(&self) -> u64 {
+        self.event_seq
+    }
+
     fn emergency_held(&self) -> bool {
         let ctrl = self.physical_down[KeyCode::ControlLeft.index()]
             || self.physical_down[KeyCode::ControlRight.index()];
@@ -119,6 +140,7 @@ impl FilterEngine {
 
     pub fn process(&mut self, key: KeyCode, phase: KeyPhase) -> EngineResult {
         let i = key.index();
+        self.event_seq = self.event_seq.wrapping_add(1);
         match phase {
             KeyPhase::Down | KeyPhase::Repeat => {
                 let first = !self.physical_down[i];
@@ -185,6 +207,10 @@ pub trait KeyboardController: Send + Sync {
     fn disabled_keys(&self) -> Vec<KeyCode>;
     fn set_cat_lock(&self, locked: bool);
     fn is_cat_locked(&self) -> bool;
+    /// Native pressed snapshot for UI resync (HF-04).
+    fn pressed_keys(&self) -> Vec<KeyCode>;
+    /// Sequence of the last processed hook event (HF-04).
+    fn event_sequence(&self) -> u64;
 }
 
 #[cfg(test)]
@@ -319,5 +345,41 @@ mod tests {
         assert!(!engine.is_cat_locked());
         assert_eq!(result.decision, HookDecision::Forward);
         assert!(engine.is_enabled(KeyCode::KeyA));
+    }
+
+    /// HF-04: the native pressed snapshot tracks physical holds so the UI
+    /// can resync after a dropped key-up instead of guessing with a timer.
+    #[test]
+    fn pressed_snapshot_tracks_physical_hold() {
+        let mut engine = FilterEngine::new();
+        assert!(engine.pressed_keys().is_empty());
+        down(&mut engine, KeyCode::KeyA);
+        down(&mut engine, KeyCode::ShiftLeft);
+        let pressed = engine.pressed_keys();
+        assert!(pressed.contains(&KeyCode::KeyA));
+        assert!(pressed.contains(&KeyCode::ShiftLeft));
+        // Repeat does not change the snapshot.
+        engine.process(KeyCode::KeyA, KeyPhase::Repeat);
+        assert_eq!(engine.pressed_keys().len(), 2);
+        up(&mut engine, KeyCode::KeyA);
+        assert_eq!(engine.pressed_keys(), vec![KeyCode::ShiftLeft]);
+        up(&mut engine, KeyCode::ShiftLeft);
+        assert!(engine.pressed_keys().is_empty());
+    }
+
+    /// HF-04: the sequence bumps on every processed event, giving the UI a
+    /// cheap "did anything change while I was away" signal.
+    #[test]
+    fn event_sequence_increases_on_every_event() {
+        let mut engine = FilterEngine::new();
+        let s0 = engine.event_sequence();
+        down(&mut engine, KeyCode::KeyA);
+        let s1 = engine.event_sequence();
+        assert!(s1 > s0);
+        engine.process(KeyCode::KeyA, KeyPhase::Repeat);
+        let s2 = engine.event_sequence();
+        assert!(s2 > s1);
+        up(&mut engine, KeyCode::KeyA);
+        assert!(engine.event_sequence() > s2);
     }
 }

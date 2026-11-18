@@ -44,8 +44,12 @@ export interface Profile {
   builtin: boolean;
 }
 
-export interface AppSnapshot {
-  hookActive: boolean;
+export interface PressedSnapshot {
+  pressed: string[];
+  sequence: number;
+}
+
+export interface AppSnapshot {  hookActive: boolean;
   hookError: string | null;
   layoutId: string;
   profileId: string;

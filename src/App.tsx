@@ -34,33 +34,76 @@ export default function App() {
       if (!event.code) return;
       useAppStore.getState().notePress(event.code, false);
     };
+    // HF-04: key-up events can be missed while the window is hidden or the
+    // machine sleeps. Reconcile with the native pressed snapshot instead
+    // of trusting the (lossy) event stream alone.
+    const resync = () => {
+      void useAppStore.getState().resyncPressed();
+    };
+    const onFocus = () => resync();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") resync();
+    };
     window.addEventListener("keydown", onWindowDown, true);
     window.addEventListener("keyup", onWindowUp, true);
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
 
-    Promise.all([
-      api.onKeyDown((code) => useAppStore.getState().notePress(code, true)),
-      api.onKeyUp((code) => useAppStore.getState().notePress(code, false)),
-      api.onStateChanged((keys) => useAppStore.setState({ disabledKeys: keys })),
-      api.onEmergencyUnlock(() => {
-        useAppStore.getState().showEmergency();
-        void useAppStore.getState().hydrate();
-      }),
-      api.onProfileChanged(() => {
-        void useAppStore.getState().hydrate();
-      }),
-      api.onCatLock((locked) => useAppStore.setState({ catLock: locked })),
-    ]).then((fns) => {
-      if (cancelled) {
-        fns.forEach((fn) => fn());
+    // HF-09/HF-05: subscribe independently. If any listener fails, the ones
+    // that already registered are unlistened again instead of leaking, and
+    // the failure is surfaced (previously Promise.all dropped everything
+    // silently on a single rejection).
+    const subscribe = (async () => {
+      const results = await Promise.allSettled([
+        api.onKeyDown((code) => useAppStore.getState().notePress(code, true)),
+        api.onKeyUp((code) => useAppStore.getState().notePress(code, false)),
+        api.onStateChanged((keys) => useAppStore.setState({ disabledKeys: keys })),
+        api.onEmergencyUnlock(() => {
+          useAppStore.getState().showEmergency();
+          void useAppStore.getState().hydrate();
+          void useAppStore.getState().resyncPressed();
+        }),
+        api.onProfileChanged(() => {
+          void useAppStore.getState().hydrate();
+        }),
+        api.onCatLock((locked) => useAppStore.setState({ catLock: locked })),
+      ]);
+      const fns: Array<() => void> = [];
+      let failure: unknown = null;
+      for (const result of results) {
+        if (result.status === "fulfilled") {
+          fns.push(result.value);
+        } else if (failure === null) {
+          failure = result.reason;
+        }
+      }
+      if (cancelled || failure !== null) {
+        for (const fn of fns) {
+          try {
+            fn();
+          } catch {
+            // Best effort: never let cleanup itself throw.
+          }
+        }
+        if (failure !== null && !cancelled) {
+          useAppStore.setState({ eventError: t("eventSubscribeFailed") });
+        }
         return;
       }
       unlisteners.push(...fns);
+    })();
+    void subscribe.catch(() => {
+      // allSettled never rejects; this is unreachable by construction, but
+      // a rejected promise must never escape silently (HF-05).
     });
 
     return () => {
       cancelled = true;
       window.removeEventListener("keydown", onWindowDown, true);
       window.removeEventListener("keyup", onWindowUp, true);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+      useAppStore.getState().clearPressTracking();
       unlisteners.forEach((fn) => fn());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -130,29 +173,33 @@ export default function App() {
           </div>
         )}
 
-        {(store.error || (!store.persisted && store.persistError)) && (
+        {(store.error || store.eventError || (!store.persisted && store.persistError)) && (
           <div className="mb-4 flex items-center justify-between gap-4 rounded-xl border border-danger/30 bg-danger/10 px-4 py-3 text-sm text-danger">
             <span>
-              {store.persistErrorKind === "newer_version"
-                ? t("newerVersionSettings")
-                : store.error
-                  ? `${t("settingsSaveFailed")} ${store.error}`
-                  : `${t("settingsUnsaved")} ${store.persistError ?? ""}`}
+              {store.eventError
+                ? store.eventError
+                : store.persistErrorKind === "newer_version"
+                  ? t("newerVersionSettings")
+                  : store.error
+                    ? `${t("settingsSaveFailed")} ${store.error}`
+                    : `${t("settingsUnsaved")} ${store.persistError ?? ""}`}
             </span>
-            <span className="flex flex-shrink-0 gap-2">
-              <button
-                className="h-8 rounded-lg border border-danger/40 px-3 text-xs hover:bg-danger/10"
-                onClick={() => void store.retryPersist()}
-              >
-                {t("retry")}
-              </button>
-              <button
-                className="h-8 rounded-lg border border-danger/40 px-3 text-xs hover:bg-danger/10"
-                onClick={() => void store.enableAll()}
-              >
-                {t("enableAll")}
-              </button>
-            </span>
+            {!store.eventError && (
+              <span className="flex flex-shrink-0 gap-2">
+                <button
+                  className="h-8 rounded-lg border border-danger/40 px-3 text-xs hover:bg-danger/10"
+                  onClick={() => void store.retryPersist()}
+                >
+                  {t("retry")}
+                </button>
+                <button
+                  className="h-8 rounded-lg border border-danger/40 px-3 text-xs hover:bg-danger/10"
+                  onClick={() => void store.enableAll()}
+                >
+                  {t("enableAll")}
+                </button>
+              </span>
+            )}
           </div>
         )}
 
@@ -169,6 +216,7 @@ export default function App() {
               layout={layout}
               disabledKeys={store.disabledKeys}
               pressedKeys={store.pressedKeys}
+              staleKeys={store.staleKeys}
               catLock={store.catLock}
               onToggle={store.toggleKey}
             />
