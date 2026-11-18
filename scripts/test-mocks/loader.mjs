@@ -45,3 +45,20 @@ export async function resolve(specifier, context, nextResolve) {
     throw err;
   }
 }
+
+// JSON modules: Vite lets the app `import data from "./x.json"` with no
+// attribute; Node's ESM loader demands `with { type: "json" }`. Serve
+// .json files as JS modules with a default export instead, so the real
+// layout/catalog modules run unmodified under node.
+export async function load(url, context, nextLoad) {
+  if (url.endsWith(".json")) {
+    const { readFile } = await import("node:fs/promises");
+    const source = await readFile(new URL(url), "utf8");
+    return {
+      format: "module",
+      source: `export default ${source};`,
+      shortCircuit: true,
+    };
+  }
+  return nextLoad(url, context);
+}

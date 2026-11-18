@@ -1,4 +1,6 @@
 pub mod app_profiles;
+pub mod layout_import;
+pub mod layout_registry;
 pub mod models;
 pub mod storage;
 

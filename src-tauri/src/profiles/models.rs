@@ -1,21 +1,13 @@
 use crate::keyboard::KeyCode;
 use crate::profiles::app_profiles::{dedupe_rules, normalize_executable_path, AppRule};
+use crate::profiles::layout_import::{validate_layout, ImportedLayout};
+use crate::profiles::layout_registry::is_valid_layout_id;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub const CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_LAYOUT: &str = "tkl-ansi";
 pub const DEFAULT_PROFILE_ID: &str = "default";
-
-/// Canonical layout ids. The layout registry (G-stage) will replace this
-/// list; until then every validation site shares this one constant.
-pub const VALID_LAYOUT_IDS: &[&str] = &[
-    "fullsize-ansi",
-    "tkl-ansi",
-    "75-ansi",
-    "65-ansi",
-    "60-ansi",
-];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +40,10 @@ pub struct AppConfig {
     pub theme: String,
     #[serde(default)]
     pub profiles: Vec<Profile>,
+    /// Imported custom layouts (S6). Persisted; validated on import
+    /// and revalidated in `normalize` (invalid entries are dropped).
+    #[serde(default)]
+    pub custom_layouts: Vec<ImportedLayout>,
     /// App rules (S5): foreground executable -> profile. Persisted.
     #[serde(default)]
     pub app_rules: Vec<AppRule>,
@@ -91,6 +87,7 @@ impl Default for AppConfig {
             locale: String::new(),
             theme: "dark".to_string(),
             profiles: builtin_profiles(),
+            custom_layouts: vec![],
             app_rules: vec![],
             auto_profile_enabled: true,
             future_version: false,
@@ -174,9 +171,26 @@ impl AppConfig {
             tracing::warn!("Default profile missing; restoring it");
             self.profiles.insert(0, default_profile_entry());
         }
+        // S6: custom layouts are cleaned before the profile loop below,
+        // so a profile can only reference a layout that survived
+        // validation. Keep the first occurrence per id; drop builtin
+        // collisions and anything that fails revalidation.
+        let mut seen_layouts = HashSet::new();
+        self.custom_layouts.retain(|l| {
+            if !seen_layouts.insert(l.id.clone()) {
+                tracing::warn!("duplicate custom layout {:?}; removed", l.id);
+                return false;
+            }
+            if let Err(e) = validate_layout(l) {
+                tracing::warn!("custom layout {:?} failed validation ({e}); removed", l.id);
+                return false;
+            }
+            true
+        });
         for profile in &mut self.profiles {
-            // Per-profile layout must be a known layout id.
-            if !VALID_LAYOUT_IDS.contains(&profile.layout.as_str()) {
+            // Per-profile layout must be a known layout id (builtin or
+            // an imported custom layout).
+            if !is_valid_layout_id(&profile.layout, &self.custom_layouts) {
                 tracing::warn!(
                     "profile {} has invalid layout {:?}; resetting to {DEFAULT_LAYOUT}",
                     profile.id,
@@ -364,6 +378,59 @@ mod tests {
         assert_eq!(cfg.selected_profile, "wide");
         assert_eq!(cfg.selected_layout, "fullsize-ansi");
         assert!(cfg.activate_profile("nope").is_err());
+    }
+
+    #[test]
+    fn custom_layout_roundtrip_and_profile_reference() {
+        // S6: an imported custom layout survives save/load, and a
+        // profile may reference it.
+        let raw = include_str!("../../../src/layouts/fullsize-iso.json");
+        let mut value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        value["id"] = serde_json::Value::String("my-iso".to_string());
+        let layout: crate::profiles::layout_import::ImportedLayout =
+            serde_json::from_value(value).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.custom_layouts.push(layout);
+        cfg.profiles.push(Profile {
+            id: "iso-user".into(),
+            name: "ISO user".into(),
+            layout: "my-iso".into(),
+            disabled_keys: vec![],
+            builtin: false,
+        });
+        let cfg = cfg.normalize();
+        assert_eq!(cfg.custom_layouts.len(), 1);
+        assert_eq!(cfg.profile("iso-user").unwrap().layout, "my-iso");
+        // Persisted form keeps the custom layout.
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        let reloaded: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reloaded.custom_layouts.len(), 1);
+        assert_eq!(reloaded.custom_layouts[0].keys.len(), 105);
+    }
+
+    #[test]
+    fn normalize_drops_invalid_custom_layout_and_resets_profile() {
+        // S6: a stored custom layout that no longer validates is
+        // dropped, and profiles pointing at it fall back to Default.
+        let raw = include_str!("../../../src/layouts/fullsize-jis.json");
+        let mut value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        value["id"] = serde_json::Value::String("my-jis".to_string());
+        // Break it after parsing: an out-of-range key.
+        value["keys"][0]["x"] = serde_json::Value::from(99.0);
+        let layout: crate::profiles::layout_import::ImportedLayout =
+            serde_json::from_value(value).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.custom_layouts.push(layout);
+        cfg.profiles.push(Profile {
+            id: "jis-user".into(),
+            name: "JIS user".into(),
+            layout: "my-jis".into(),
+            disabled_keys: vec![],
+            builtin: false,
+        });
+        let cfg = cfg.normalize();
+        assert!(cfg.custom_layouts.is_empty());
+        assert_eq!(cfg.profile("jis-user").unwrap().layout, DEFAULT_LAYOUT);
     }
 
     #[test]

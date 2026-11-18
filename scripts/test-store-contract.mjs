@@ -50,6 +50,7 @@ const snap = (over = {}) => ({
   layoutId: "tkl-ansi",
   profileId: "default",
   profiles: [],
+  customLayouts: [],
   disabledKeys: [],
   onboarded: true,
   startWithWindows: false,
@@ -392,6 +393,80 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   __mockInvoke("delete_app_rule", () => undefined);
   await useAppStore.getState().removeAppRule("r1");
   check("T9 delete rule refreshes snapshot", eq(useAppStore.getState().appRules, []));
+}
+
+// ---------------------------------------------------------------- T10
+// S6: import preview. The preview is pure local state: beginning it
+// changes nothing about the selected layout, and cancelling leaves the
+// original layout selected. Confirming persists through import_layout,
+// refreshes the snapshot (custom layouts land in the store), and then
+// selects the imported layout.
+{
+  const useAppStore = await freshStore();
+  __resetInvoke();
+  const preview = {
+    id: "my-mini",
+    name: "My Mini",
+    category: "custom",
+    unitWidth: 54,
+    gap: 5,
+    width: 2,
+    height: 1,
+    keys: [
+      { code: "KeyA", vk: "VK_A", vkCode: 0x41, label: "A", x: 0, y: 0, w: 1, h: 1, category: "alpha" },
+      { code: "KeyB", vk: "VK_B", vkCode: 0x42, label: "B", x: 1, y: 0, w: 1, h: 1, category: "alpha" },
+    ],
+  };
+  const st = useAppStore.getState();
+  st.beginImportPreview(preview);
+  check("T10 preview held without changing layout", useAppStore.getState().importPreview === preview);
+  check("T10 preview does not change selected layout", useAppStore.getState().layoutId === "tkl-ansi");
+  st.cancelImportPreview();
+  check("T10 cancel clears preview", useAppStore.getState().importPreview === null);
+  check("T10 cancel keeps original layout", useAppStore.getState().layoutId === "tkl-ansi");
+
+  // Confirm: import, refresh, select.
+  let importedJson = null;
+  let selectedId = null;
+  __mockInvoke("import_layout", (args) => {
+    importedJson = args.json;
+    return JSON.parse(args.json);
+  });
+  __mockInvoke("select_layout", (args) => {
+    selectedId = args.id;
+    return undefined;
+  });
+  __mockInvoke("get_app_state", () =>
+    snap({ customLayouts: [preview], layoutId: "tkl-ansi", runtimeRevision: 10 }),
+  );
+  st.beginImportPreview(preview);
+  await useAppStore.getState().confirmImportPreview();
+  const s = useAppStore.getState();
+  check("T10 confirm sends preview JSON to backend", JSON.parse(importedJson).id === "my-mini");
+  check("T10 confirm refreshes custom layouts", eq(s.customLayouts, [preview]));
+  check("T10 confirm selects imported layout", s.layoutId === "my-mini");
+  check("T10 confirm selects via backend", selectedId === "my-mini");
+  check("T10 confirm clears preview", s.importPreview === null);
+
+  // Hydrate carries custom layouts into the store (and the registry).
+  __mockInvoke("get_app_state", () =>
+    snap({ customLayouts: [preview], layoutId: "my-mini", runtimeRevision: 11 }),
+  );
+  await useAppStore.getState().hydrate();
+  check("T10 hydrate carries custom layouts", eq(useAppStore.getState().customLayouts, [preview]));
+  // Plain import (no query): the same layouts.ts instance the store
+  // mirrors custom layouts into. A ?case= import would be a second
+  // module instance with an empty registry.
+  const { getLayout, setCustomLayouts } = await import(`../src/lib/layouts.ts`);
+  check("T10 registry resolves imported layout", getLayout("my-mini").id === "my-mini");
+  // Reset the shared registry so later tests see a clean builtin set.
+  setCustomLayouts([]);
+
+  // Delete: backend call + snapshot refresh.
+  __mockInvoke("delete_custom_layout", () => undefined);
+  __mockInvoke("get_app_state", () => snap({ customLayouts: [], runtimeRevision: 12 }));
+  await useAppStore.getState().deleteCustomLayout("my-mini");
+  check("T10 delete refreshes custom layouts", eq(useAppStore.getState().customLayouts, []));
 }
 
 console.log(`\n${passed} assertions passed`);

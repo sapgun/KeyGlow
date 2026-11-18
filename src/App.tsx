@@ -1,7 +1,8 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Keyboard } from "./components/Keyboard/Keyboard";
 import { AppRulesPanel } from "./components/AppRulesPanel";
 import { LayoutSelector } from "./components/LayoutSelector";
+import { LayoutImportDialog } from "./components/LayoutImportDialog";
 import { Onboarding } from "./components/Onboarding";
 import { ProfileSelector } from "./components/ProfileSelector";
 import { StatusBar } from "./components/StatusBar";
@@ -18,6 +19,7 @@ export default function App() {
   const locale = useLocale();
   const layout = getLayout(store.layoutId);
   const profile = store.profiles.find((item) => item.id === store.profileId);
+  const [importOpen, setImportOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -166,6 +168,12 @@ export default function App() {
           </div>
           <div className="flex flex-wrap items-end gap-6">
             <LayoutSelector value={store.layoutId} onChange={store.chooseLayout} />
+            <button
+              className="mb-0.5 h-9 rounded-lg border border-border bg-panel-2 px-3 text-sm hover:border-lime/40"
+              onClick={() => setImportOpen(true)}
+            >
+              {t("importLayout")}
+            </button>
             <ProfileSelector
               profiles={store.profiles}
               value={store.profileId}
@@ -303,6 +311,7 @@ export default function App() {
         profileName={profile ? profileLabel(profile, locale) : t("profile.default")}
         disabledCount={store.disabledKeys.length}
       />
+      {importOpen && <LayoutImportDialog onClose={() => setImportOpen(false)} />}
     </div>
   );
 }

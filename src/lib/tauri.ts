@@ -8,6 +8,7 @@ import type {
   CatLockPayload,
   EmergencyPayload,
   HookStatusPayload,
+  KeyboardLayout,
   PressedSnapshot,
   Profile,
   StateChangedPayload,
@@ -37,6 +38,20 @@ export function setCatLock(locked: boolean) {
 
 export function selectLayout(id: string) {
   return invoke<void>("select_layout", { id });
+}
+
+// S6: layout import. The backend validates again and persists; the
+// returned layout is the stored one.
+export function importLayout(json: string) {
+  return invoke<KeyboardLayout>("import_layout", { json });
+}
+
+export function deleteCustomLayout(id: string) {
+  return invoke<void>("delete_custom_layout", { id });
+}
+
+export function listCustomLayouts() {
+  return invoke<KeyboardLayout[]>("list_custom_layouts");
 }
 
 export function selectProfile(id: string) {

@@ -430,3 +430,66 @@ Detection limits (documented honestly, not claimed otherwise):
   fall back to Default. There is no userspace way to identify such a
   process's exe reliably, and guessing from the window title is
   explicitly out of scope.
+
+## ADR: layout registry, ISO/JIS, and layout import (S6)
+
+Builtin layouts are generated JSON under `src/layouts/`
+(`scripts/generate-layouts.mjs`): 5 ANSI layouts plus fullsize ISO
+(105 keys) and fullsize JIS (109 keys). The registry owns the id list
+(`src-tauri/src/profiles/layout_registry.rs`,
+`src/lib/layouts.ts`); the old `VALID_LAYOUT_IDS` constant is now an
+alias of it. Layout packs (HHKB, Alice, split) extend the registry
+later by adding ids and JSON files — no other code changes.
+
+Decisions and why:
+
+- **One physical key, one code; layouts differ by label.** Scan 0x2B
+  is the ANSI Backslash, the ISO `#`, and the JIS `]` key. The hook
+  reports all three as `Backslash`; ISO/JIS only relabel it. There is
+  no `IntlHash` code.
+- **Shared VKs are disambiguated by scan code.** VK_OEM_102 (0xE2)
+  is the ISO extra key at scan 0x56 and the JIS ro key at scan 0x73;
+  VK_OEM_5 (0xDC) is Backslash at scan 0x2B and the JIS yen key at
+  scan 0x7D. `identify_key` branches on the scan code for both.
+- **The tall L-shaped ISO/JIS Enter is one 1.25u x 2u rectangle.**
+  The renderer draws plain rectangles, so the true L shape is
+  approximated at x=13.75, which leaves a 0.25u visual gap on the Q
+  row. Documented in the generator; a real L-shaped key is a renderer
+  change, not a layout change.
+- **JIS reuses ANSI codes by position, with JIS legends.** Backquote
+  is 半角/全角, Equal is `^`, BracketLeft is `@`, BracketRight is `[`,
+  Backslash is `]`. New codes are only the five extra scan codes:
+  `IntlYen` (0x7D, VK_OEM_5 provisional), `IntlRo` (0x73),
+  `Convert` (0x79, VK_CONVERT), `NonConvert` (0x7B, VK_NONCONVERT),
+  `KanaMode` (0x70, VK_KANA).
+- **Import validates twice, stores only validated JSON.** The dialog
+  validates with the TS mirror (`src/lib/layout-import.ts`) so the
+  user sees the reason immediately; the backend re-validates
+  (`src-tauri/src/profiles/layout_import.rs`) before persisting.
+  Limits: 64 KiB, 120 keys, coordinates in [0, 64], key size in
+  (0, 16], id `^[a-z0-9][a-z0-9-]{0,63}$`, no builtin id collision,
+  no unknown fields, no duplicate codes, no overlaps, declared
+  width/height must match the keys. A failed import leaves the config
+  and the selected layout untouched.
+- **Preview is local state, not a layout change.** The store holds the
+  validated layout in `importPreview`; applying it imports and then
+  selects it. Cancelling (or closing the dialog) drops the preview;
+  the original layout was never touched.
+- **Custom layouts are revalidated at load.** `AppConfig::normalize`
+  drops stored custom layouts that fail validation (or collide with a
+  builtin id, or duplicate an id), and profiles pointing at a dropped
+  layout fall back to Default. Deleting a custom layout is refused
+  while any profile uses it, so no profile is left dangling.
+- **The 5 ANSI layouts are pinned by golden hashes.**
+  `scripts/validate-layouts.mjs` fails if any ANSI file's bytes
+  change; the hashes are updated only deliberately, after review.
+
+Detection limits (documented honestly, not claimed otherwise):
+
+- `IntlYen`'s VK_OEM_5 is provisional (AHK documents vkDCsc07D).
+  The scan/VK pairs for all six new codes are unconfirmed until a
+  real ISO/JIS keyboard is tested on Windows; see the S6 physical
+  checklist (Test 22).
+- The registry cannot tell whether a connected keyboard is actually
+  ISO or JIS; the user picks the layout. A wrong pick renders fine
+  but maps the extra keys to the wrong legends.

@@ -351,3 +351,65 @@ Physical (needs the rig):
    blocked; the lock is not lifted by the switch.
 6. Close the game while its profile is effective. Expected: Default
    returns; no error banner appears.
+
+## Test 22 — ISO/JIS layouts and layout import (S6)
+
+Automated (layout validation in `scripts/validate-layouts.mjs`, 7
+layouts incl. golden SHA-256 content hashes pinning the 5 ANSI files
+(line-ending-insensitive, so a Windows CRLF checkout passes); catalog sync in `scripts/test-catalog-sync.mjs` and
+`keycodes.rs::catalog_matches_ts_key_catalog`, 110 codes in Rust,
+META, and the TS catalog; import validation in
+`scripts/test-layout-import.mjs`, 18 assertions, and
+`layout_import.rs`, 13 tests; store contract in
+`scripts/test-store-contract.mjs`, T10, 12 assertions; model tests in
+`models.rs`, 2 tests):
+
+- 5 ANSI layouts regenerate byte-identical (`npm run gen:layouts`
+  leaves no diff); ISO has 105 keys, JIS 109 keys, no duplicates, no
+  out-of-range coordinates, no overlaps.
+- ISO/JIS required keys present: IntlBackslash + `#` label (Backslash
+  code) on ISO; IntlYen, IntlRo, Convert, NonConvert, KanaMode on JIS.
+- Rust/TS catalogs agree on all 110 codes, including the 6 new ones;
+  IntlHash is not a code.
+- `identify_key` disambiguates the shared VKs by scan: 0xE2/0x56
+  IntlBackslash, 0xE2/0x73 IntlRo, 0xDC/0x7D IntlYen, 0xDC/0x2B
+  Backslash; Convert 0x1C, NonConvert 0x1D, KanaMode 0x15.
+- Importer rejects: oversize JSON, >120 keys, out-of-range
+  coordinates, duplicate codes, unknown codes, unknown fields,
+  builtin id collision, bad id format, overlapping keys, dimension
+  mismatch, Fn without `unsupported`. A rejected import leaves the
+  config and the selected layout untouched.
+- Import preview: beginning a preview does not change the selected
+  layout; cancelling keeps the original layout; confirming imports,
+  refreshes the snapshot, and selects the imported layout; the
+  registry resolves the imported layout afterwards.
+- Imported layout round-trips through save/load; a profile may
+  reference it. A stored custom layout that no longer validates is
+  dropped at normalize time and its profiles fall back to Default.
+- Deleting a custom layout refreshes the snapshot; deleting one in
+  use is refused by the backend.
+
+Physical (needs the rig + real ISO/JIS keyboards):
+
+1. Select fullsize ISO. Expected: 105 keys render; the tall Enter
+   shows as one rectangle; the `#` key sits on the A row and the
+   extra key sits between Left Shift and Z.
+2. Select fullsize JIS. Expected: 109 keys render; Yen sits between
+   `^` and Backspace; the bottom row shows 無変換, Space, 変換, かな.
+3. On a real ISO keyboard, press the extra key, then the `#` key.
+   Expected: the extra key glows IntlBackslash and `#` glows
+   Backslash. Record the scan/VK pairs the hook reports.
+4. On a real JIS keyboard, press Yen, Ro, 変換, 無変換, かな.
+   Expected: each glows its own code. Record the scan/VK pairs; in
+   particular confirm whether Yen reports VK_OEM_5 (provisional).
+5. Import a valid layout JSON from a file. Expected: the preview
+   renders the layout; Apply selects it; the profile keeps it after
+   restart.
+6. Import an invalid JSON (e.g. an unknown key code). Expected: the
+   dialog shows the rejection reason and the current layout is
+   unchanged.
+7. In the import dialog, cancel after a valid preview. Expected: the
+   original layout is still selected; nothing was stored.
+8. Delete an imported layout that no profile uses. Expected: it
+   disappears from the selector. Try to delete one a profile uses.
+   Expected: the backend refuses and the layout stays.
