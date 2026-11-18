@@ -526,3 +526,35 @@ Detection limits (documented honestly, not claimed otherwise):
 - The registry cannot tell whether a connected keyboard is actually
   ISO or JIS; the user picks the layout. A wrong pick renders fine
   but maps the extra keys to the wrong legends.
+
+## ADR: key remapping (S8)
+
+ADR only; no product code. Full decisions in
+`docs/ADR-REMAPPING.md`. Headlines:
+
+- **Scope:** 1:1 single-key remaps, per-profile rules, session-global
+  (not per-device). Chord remaps, macros, layers are S9. No driver,
+  no admin, no registry — userspace `SendInput` only.
+- **Loop prevention by construction:** the callback skips every event
+  with `LLKHF_INJECTED` / `LLKHF_LOWER_IL_INJECTED` set, so an
+  injected target never remaps again; no chaining (`A→B`, `B→C`
+  types `b`). Injection is synchronous in the callback, at most one
+  `INPUT` per event; failure fails open (forwards the physical key).
+- **Pairing:** per-source held mapping snapshotted at down time plus
+  a per-target refcount (shared targets allowed). Rule changes,
+  profile switches, and emergency flush held remaps first; new rules
+  apply to the next press only.
+- **Emergency:** evaluated from physical state before any remap
+  decision, always wins; flushes held remaps; rules survive the
+  unlock. Cat Lock beats remap. Injected events never count toward
+  the chord and never glow.
+- **Cleanup:** pre-unhook flush on tray Exit; startup sweep (batched
+  `SendInput` ups for all codes, skipping keys `GetAsyncKeyState`
+  reports as held) covers force-kill. Hook-thread death cannot
+  flush — documented residual risk.
+- **Validation:** one rule per source; no disabled participants
+  (either direction); `Pause` excluded both ways; toggle keys
+  excluded as targets; scan-code injection with a
+  `to_vk_scan`/`identify_key` roundtrip over all 110 codes.
+- **Limits:** UIPI may keep injected keys from elevated apps;
+  Win+L / Ctrl+Alt+Del are not remappable; no per-device remapping.
