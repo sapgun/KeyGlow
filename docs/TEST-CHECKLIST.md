@@ -470,3 +470,94 @@ Physical (needs the rig + two keyboards):
 8. Sleep/resume the machine with both keyboards attached.
    Expected: enumeration and attribution resume without restart,
    and stored device identities are still valid.
+
+## Test 24 — Key remapping (S8)
+
+ADR only so far (`docs/ADR-REMAPPING.md`): no remap code exists
+yet. The automated checks below apply once the implementation
+lands; the physical checks settle the open questions in the ADR
+(§11). Nothing here is verified yet.
+
+Automated (once implemented; engine unit tests in `engine.rs`,
+frontend contract in `scripts/test-store-contract.mjs`, T11
+pattern; Windows CI):
+
+- Down injects the target once; repeat injects nothing; up injects
+  the target up. A source up after a rule change releases the
+  down-time target, never the new one.
+- Shared target refcount: two sources held, first release injects
+  nothing, second release injects the up.
+- Flush on rule change / profile switch / emergency injects ups
+  for held targets only, is idempotent, and installs new rules for
+  the next press only.
+- Injected events never remap, never set `physical_down`, never
+  count toward the emergency chord, and still respect disable /
+  Cat Lock.
+- Validation: duplicate source, self-map, disabled participant in
+  both directions (disable a rule participant is rejected; create
+  a rule naming a disabled key is rejected), `Pause` as source and
+  target, toggle keys as targets, unknown ids dropped at load.
+- Reverse-table roundtrip: `identify_key(to_vk_scan(k)) == k` for
+  all 110 codes, including the S6 scan disambiguations.
+- Frontend: rule CRUD drives the real invoke layer and refreshes
+  the snapshot; a stale rule-change response is dropped by the
+  ordering gate; an emergency floors a pending rule-change
+  response.
+
+Physical (needs the rig):
+
+1. Create rule `A → B` on the Default profile. Focus Notepad, press
+   `A`. Expected: `b` appears. Press `B`. Expected: `b` appears
+   (B itself is unmapped). The rule is listed in the UI; `A`'s
+   keycap shows the remap.
+2. Hold the remapped `A` for 5 seconds. Expected: `b` repeats (or
+   record that it does not — ADR open question 1). Release.
+   Expected: no further `b` appears; no stuck key.
+3. With `A → B`, hold Shift and press `A`. Expected: `B` appears.
+   With a rule `ShiftLeft → ControlLeft`, hold Shift and press `C`
+   in an editor. Expected: copy behaviour (Ctrl+C).
+4. With `ShiftLeft → ControlLeft`, press and release Shift alone.
+   Expected: nothing visible happens; the next plain keypress is
+   unaffected (no stuck Control).
+5. Hold `A` (mapped to `B`), delete the rule while holding, then
+   release `A`. Expected: no extra `b` after the release; the next
+   `A` press types `a`.
+6. Hold `A` on the Gaming profile (maps `A → B`), switch to Default
+   mid-hold, release `A`. Expected: no stuck `B`; `A` types `a`
+   afterwards.
+7. Hold `A` (mapped to `B`), then press `Ctrl + Shift + F12` with
+   the other hand. Expected: all keys enabled, no stuck `b`, the
+   rule is still listed in the UI, Default is effective.
+8. Enable Cat Lock, press the remapped `A`. Expected: nothing is
+   typed. Disable Cat Lock. Expected: the remap works again.
+9. With rule `A → B`, try to disable `B` in the UI. Expected: the
+   disable is refused with a message naming the rule. Disable `A`
+   in a fresh profile, then try to create `A → B`. Expected: the
+   rule is refused.
+10. Create rules `A → B` and `B → C`. Press `A`. Expected: `b`
+    appears, not `c` (no chaining).
+11. Try to create `A → A`, two rules with the same source, `Pause`
+    as a source, `Pause` as a target, and `A → CapsLock`. Expected:
+    all five are refused. Create `CapsLock → ControlLeft`.
+    Expected: accepted; pressing CapsLock no longer toggles caps.
+12. With `A` disabled, use the on-screen keyboard (or AutoHotkey)
+    to send `A`. Expected: still blocked (v0.1 behaviour kept).
+    Use it to send a remap source. Expected: the physical key
+    passes through un-remapped (remap is physical-only).
+13. Open an elevated (Run as administrator) Notepad. Press the
+    remapped key. Expected: record whether the target arrives.
+    If it does not, the physical key is forwarded instead (UIPI —
+    ADR open question 2). No admin prompt from KeyGlow itself.
+14. Hold a remapped key, choose tray **Exit** while holding.
+    Expected: the target is released cleanly (no stuck key after
+    exit). Repeat with a force-kill while holding, then restart
+    the app. Expected: the target is not stuck after restart
+    (startup sweep).
+15. Remap `CapsLock → ControlLeft` and press CapsLock. Expected:
+    caps does not toggle and no Control sticks. Remap
+    `MetaLeft → ControlLeft`, press Left Win. Expected: Start menu
+    does not open. Press `Win + L`. Expected: the machine still
+    locks (secure combos are not remappable).
+16. Create `A → B` and `C → B`. Hold `A`, hold `C`, release `A`.
+    Expected: `B` is still held (a held-`b` repeat or a test app
+    shows it down). Release `C`. Expected: `B` is released.
