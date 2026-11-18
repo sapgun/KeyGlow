@@ -1,6 +1,6 @@
 use crate::keyboard::engine::KeyboardController;
 use crate::keyboard::hook::HookEvent;
-use crate::keyboard::{FilterEngine, SafetyState};
+use crate::keyboard::{FilterEngine, HookExit, SafetyState};
 use parking_lot::Mutex;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -21,6 +21,11 @@ pub struct ControllerStart {
     /// Wake receiver for the safety worker. Unbounded channel: the hook
     /// never blocks on it.
     pub safety_wake: Receiver<()>,
+    /// Terminal-state reports from the hook thread (HF-07). `Some` on
+    /// Windows when the hook was installed; the watcher in `lib.rs` flips
+    /// `hook_active`/`hook_error` if the thread dies on its own, so the UI
+    /// never shows a stale "keyboard control active".
+    pub hook_exit: Option<Receiver<HookExit>>,
 }
 
 pub fn start_input_backend() -> ControllerStart {
@@ -47,6 +52,7 @@ pub fn start_input_backend() -> ControllerStart {
             shutdown: Arc::new(|| {}),
             safety,
             safety_wake: safety_wake_rx,
+            hook_exit: None,
         }
     }
 }

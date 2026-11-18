@@ -8,6 +8,7 @@ mod tray;
 
 use commands::*;
 use keyboard::hook::HookEvent;
+use keyboard::hook_lifecycle::HookExit;
 use keyboard::SafetyState;
 use platform::start_input_backend;
 use state::AppState;
@@ -219,6 +220,44 @@ fn spawn_safety_worker(
         .expect("failed to start safety worker thread");
 }
 
+/// Watch the hook thread's terminal report (HF-07).
+///
+/// The hook thread reports exactly once on exit. A requested shutdown is
+/// silent; an unexpected death flips `hook_active`/`hook_error` — no more
+/// stale "keyboard control active" — and emits `hook:status-changed` so the
+/// UI updates without waiting for the next snapshot poll. The update runs
+/// on this dedicated watcher thread, never on the hook callback.
+fn spawn_hook_watcher(app: tauri::AppHandle, exit_rx: Receiver<HookExit>) {
+    std::thread::Builder::new()
+        .name("keyglow-hook-watch".into())
+        .spawn(move || {
+            while let Ok(exit) = exit_rx.recv() {
+                // Records the exit in the lifecycle machine; true only when
+                // this newly surfaced a failure (announce-once).
+                if !keyboard::hook::lifecycle_note_thread_exit(&exit) {
+                    continue;
+                }
+                let reason = exit.error.unwrap_or_else(|| {
+                    "keyboard hook stopped unexpectedly; restart the app to restore keyboard control"
+                        .to_string()
+                });
+                tracing::error!("keyboard hook thread died: {reason}");
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.hook_active.store(false, Ordering::SeqCst);
+                    *state.hook_error.lock() = Some(reason.clone());
+                }
+                let _ = app.emit(
+                    "hook:status-changed",
+                    commands::keyboard::HookStatusPayload {
+                        hook_active: false,
+                        hook_error: Some(reason),
+                    },
+                );
+            }
+        })
+        .expect("failed to start hook watcher thread");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -306,6 +345,9 @@ pub fn run() {
                 backend.safety,
                 backend.safety_wake,
             );
+            if let Some(exit_rx) = backend.hook_exit {
+                spawn_hook_watcher(app.handle().clone(), exit_rx);
+            }
             tray::setup(app.handle())?;
 
             if let Some(window) = app.get_webview_window("main") {

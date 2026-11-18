@@ -258,3 +258,44 @@ Physical (not covered by automation — needs the rig):
    all keys enabled; no disabled key from the old profile reappears.
 2. With DevTools throttling the network/IPC, hold a key for 12s and
    release. Expected: no stuck glow, no dropped held key.
+
+## Test 20 — Hook lifecycle (HF-07)
+
+Automated (Windows CI, `npm run test:rust` →
+`src-tauri/src/keyboard/hook_lifecycle.rs`, 11 tests, deterministic — no
+sleeps, no thread races; the transition functions are the same ones the
+real `hook.rs` drives through its statics):
+
+- Start → ready → running → shutdown requested → requested exit → stopped
+  (requested shutdown raises no alarm).
+- A second `start_hook` is rejected with the restart guidance; the running
+  hook is undisturbed.
+- No restart after stop or after install failure.
+- Install failure records the Win32 error; a following thread-exit report
+  does not overwrite it or announce twice.
+- Unexpected thread death (panic, message-loop error) moves the lifecycle
+  to Failed exactly once and surfaces the reason.
+- Thread death during stopping without a requested shutdown is a failure.
+- Shutdown request is idempotent; ready/shutdown signals outside their
+  states are ignored (total transition table).
+
+Compile-verified on Linux against faithful `windows_sys` 0.59 stubs
+(`--cfg windows`): the queue-readiness `PeekMessageW`, the checked
+`PostThreadMessageW`, and the `catch_unwind` exit-report plumbing
+type-check; behavior on real Windows is covered by CI.
+
+Physical (needs the rig):
+
+1. Start the app, then Exit from the tray immediately (within a second).
+   Expected: the process terminates promptly — no hang in hook shutdown
+   (the pre-fix race lost WM_QUIT and hung the join forever).
+2. Repeat start → immediate Exit 10 times. Expected: no hangs, no leftover
+   `KeyGlow.exe` processes, no hook installed after exit (keys type
+   normally in Notepad).
+3. If the hook thread dies unexpectedly (e.g. kill its thread via a
+   debugger): expected — the status bar flips to "keyboard control
+   unavailable" with the error, without waiting for user interaction; a
+   second start attempt is refused with the restart guidance.
+4. Windows silently removing the hook while the thread lives is NOT
+   detectable from userspace (documented limitation): if keys stop being
+   filtered while the UI still shows active, restart the app from the tray.

@@ -70,6 +70,17 @@ pub struct EmergencyPayload {
     pub runtime_revision: u64,
 }
 
+/// Health of the keyboard hook thread (HF-07). Emitted as
+/// `hook:status-changed` when the hook thread dies on its own; the UI flips
+/// the status bar and shows the restart guidance. Never emitted on a
+/// requested shutdown.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct HookStatusPayload {
+    pub hook_active: bool,
+    pub hook_error: Option<String>,
+}
+
 pub(crate) fn state_changed_payload(state: &AppState) -> StateChangedPayload {
     let (safety_epoch, runtime_revision) = state.event_stamp();
     StateChangedPayload {

@@ -1,5 +1,5 @@
 use crate::keyboard::engine::{FilterEngine, KeyboardController};
-use crate::keyboard::hook::{start_hook, HookEvent, HookHandle};
+use crate::keyboard::hook::{start_hook, HookEvent, HookHandle, HookStart};
 use crate::keyboard::{KeyCode, SafetyState};
 use crate::platform::ControllerStart;
 use parking_lot::Mutex;
@@ -65,7 +65,7 @@ pub fn start(
     });
 
     match start_hook(engine, tx, safety.clone(), safety_wake_tx) {
-        Ok(handle) => {
+        Ok(HookStart { handle, exit }) => {
             let shutdown_slot: Arc<Mutex<Option<HookHandle>>> = Arc::new(Mutex::new(Some(handle)));
             let shutdown_slot_clone = shutdown_slot.clone();
             ControllerStart {
@@ -80,6 +80,9 @@ pub fn start(
                 }),
                 safety,
                 safety_wake: safety_wake_rx,
+                // The hook thread reports its terminal state here exactly
+                // once (HF-07); lib.rs watches it for unexpected death.
+                hook_exit: Some(exit),
             }
         }
         Err(err) => {
@@ -92,6 +95,7 @@ pub fn start(
                 shutdown: Arc::new(|| {}),
                 safety,
                 safety_wake: safety_wake_rx,
+                hook_exit: None,
             }
         }
     }

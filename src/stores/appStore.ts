@@ -63,6 +63,13 @@ interface AppStore {
   hydrate: () => Promise<void>;
   applySnapshot: (snapshot: AppSnapshot) => void;
   /**
+   * HF-07: apply a hook liveness change from the native `hook:status-changed`
+   * event. Deliberately NOT gated by the P3 ordering stamp: the hook cannot
+   * be restarted in-process, so this signal is monotonic (healthy -> dead)
+   * and a late event can never revive a dead hook or overwrite newer state.
+   */
+  setHookStatus: (hookActive: boolean, hookError: string | null) => void;
+  /**
    * P3: apply a native event's partial state only when its stamp is not
    * older than what is displayed. Late/duplicate events are dropped, so
    * they can never overwrite newer (e.g. post-emergency) state.
@@ -194,6 +201,11 @@ export const useAppStore = create<AppStore>((set, get) => {
   applySnapshot: (snapshot) => {
     const next = apply(snapshot);
     if (next) set(next);
+  },
+  setHookStatus: (hookActive, hookError) => {
+    // Monotonic health signal (see interface docs): direct set, no stamp.
+    // Never resurrects: once false it stays false until the app restarts.
+    if (!hookActive) set({ hookActive: false, hookError });
   },
   applyNativeEvent: (partial, epoch, rev) => {
     if (!isFreshStamp(epoch, rev)) return;

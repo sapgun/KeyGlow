@@ -101,6 +101,12 @@ export interface EmergencyPayload {
   runtimeRevision: number;
 }
 
+/** Hook thread health (HF-07). Emitted once when the thread dies on its own. */
+export interface HookStatusPayload {
+  hookActive: boolean;
+  hookError: string | null;
+}
+
 /** Physical key event with the native event sequence (P3). */
 export interface KeyPressPayload {
   code: string;

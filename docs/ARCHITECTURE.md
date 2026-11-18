@@ -315,3 +315,55 @@ Candidate policy to verify (do not apply blind):
 (`unsafe-inline` for styles only, because Tailwind/runtime style
 attributes may need it — confirm during the real-build verification and
 tighten if possible).
+
+## ADR: hook lifecycle contract (HF-07)
+
+The keyboard hook thread (`keyboard/hook.rs`) has exactly one supported
+lifecycle per process: `Idle -> Starting -> Running -> Stopping -> Stopped`,
+with `Failed` reachable from `Starting` (install failed) or from
+`Running`/`Stopping` (the thread died on its own). The transition table is
+owned by `keyboard/hook_lifecycle.rs` and unit-tested without Windows
+(`cargo test` runs it on Windows CI too).
+
+Decisions and why:
+
+- **No in-process restart.** `SHARED` is a `OnceLock` and `WH_KEYBOARD_LL`
+  is process-global; teardown/reinstall races (in-flight callbacks during
+  `UnhookWindowsHookEx`, the message-queue race below) make restart unsafe.
+  A second `start_hook` is rejected with an explicit error telling the
+  operator to restart the app. The old code silently ignored the new
+  handles via `OnceLock::set`, which would have left a caller believing its
+  engine was hooked.
+- **Queue-readiness race closed.** `PostThreadMessageW` to a thread without
+  a message queue fails and the message is *lost* (not delivered later).
+  The thread now calls `PeekMessageW(..., PM_NOREMOVE)` to force-create its
+  queue *before* reporting ready, so a shutdown issued right after start
+  cannot lose `WM_QUIT` and hang the `JoinHandle` join. A failed post is
+  still logged loudly instead of silently.
+- **Unexpected thread death is surfaced, not silent.** The thread reports
+  its terminal state exactly once (`HookExit { requested, error }`), panics
+  included (the body runs inside `catch_unwind`; thread death also makes
+  Windows drop the low-level hook with it). A watcher thread records the
+  exit in the lifecycle machine and, on a newly surfaced failure, flips
+  `hook_active` to false, sets `hook_error`, and emits
+  `hook:status-changed` so the UI updates without waiting for a snapshot
+  poll. The ready handshake intentionally has no timeout: `SetWindowsHookExW`
+  is synchronous and non-blocking, and a timeout would orphan the thread
+  with the hook installed and no owner.
+- **The hook callback is untouched.** No disk, network, UI, or blocking
+  channel work was added to the hot path; the exit report and the watcher
+  run once at thread teardown.
+
+Detection limits (documented honestly, not claimed otherwise):
+
+- A dead hook *thread* is detectable (above). But Windows can also
+  **silently remove the hook while our thread keeps running** (e.g. under
+  timeout pressure), and there is no userspace API that reports "my
+  `WH_KEYBOARD_LL` hook is still installed". A heartbeat only proves the
+  thread is alive, not that Windows still calls the hook — we do not claim
+  otherwise.
+- Consequence: if keyboard control silently stops working, the UI may still
+  show "active". The recovery guidance is to restart the app (tray Exit,
+  then relaunch); the emergency shortcut itself depends on the hook, so a
+  silently-removed hook also disables emergency unlock until restart. This
+  is a platform limitation, not something a userspace watchdog can fix.
