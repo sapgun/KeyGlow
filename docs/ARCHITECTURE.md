@@ -96,3 +96,51 @@ Stored as JSON. Layout and disabled-key set are separate fields. Built-in profil
 - Safety wake: unbounded `mpsc::channel::<()>`; `send` from the hook never blocks.
 - Persistence: only from command/event/safety-worker threads, never from the hook.
 - Convergence exactly-once: `SafetyState::claim_reconcile(epoch)` elects a single converger per epoch across the safety worker, the event pump fallback, and stale-command repair.
+
+## ADR: safe settings replace (HF-02)
+
+`profiles/storage.rs::atomic_write` replaces `settings.json` as follows:
+
+1. Serialize to a temp file **next to the target** (same volume) under a
+   unique name (`settings.json.tmp.<pid>.<counter>.<nanos>`). Concurrent
+   writers never share a temp file.
+2. `sync_all` the temp file (best-effort durability, not a power-loss
+   proof — do not claim power-loss durability from unit tests).
+3. `std::fs::rename` the temp over the target. On Windows this maps to
+   `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`; on the same volume the
+   destination is replaced atomically — readers see either the old or the
+   new file, never a torn or missing one.
+4. The existing file is **never deleted first**. If the rename fails, the
+   original is untouched, the temp is cleaned up, and an error is returned.
+
+All writes go through `AppState::persist`, which holds a single writer
+mutex across the config clone + save, so concurrent commands serialize
+instead of interleaving. Each successful persist bumps
+`persisted_revision`; failures are recorded (`persist_error`,
+`persist_error_kind`) and surfaced to the UI with a retry action — the
+physical input state is never rolled back because the disk write failed.
+
+## ADR: settings migration and activation policy (HF-06)
+
+- `AppConfig::migrate` runs at load: older versions normalize to the
+  current schema (sequential per-version arms can be added later);
+  **newer versions are never silently downgraded** — the config is kept
+  read-only in memory (`future_version`), and `persist` refuses to
+  overwrite the file until the app is updated.
+- `AppConfig::normalize` repairs a current-version file: profiles exist,
+  profile ids are unique, the Default profile is restored if missing,
+  per-profile layouts are validated, unknown key ids are dropped, and the
+  selected profile exists.
+- Activation invariant: `selected_layout == current_profile.layout`,
+  enforced by the single `AppConfig::activate_profile` policy used by
+  select / duplicate / create / delete-fallback / emergency unlock.
+
+## Rollback policy (HF-03)
+
+- Normal edits apply optimistically to runtime + in-memory config, then
+  persist. On persist failure the applied state stays (it is the truth the
+  user sees) and the UI shows an error banner with Retry and Enable-All
+  actions; the unsaved state persists across hydrates until a retry
+  succeeds. Restart loads the last good file from disk.
+- Emergency unlock and Enable-All are never cancelled by a persist
+  failure: physical input recovery is unconditional (HF-01 contract).

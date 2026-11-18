@@ -1,6 +1,7 @@
 use crate::profiles::{Profile, DEFAULT_PROFILE_ID};
 use crate::state::{parse_key_ids, AppState};
 use crate::tray;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, State};
 
@@ -14,13 +15,8 @@ pub fn select_profile(app: AppHandle, state: State<AppState>, id: String) -> Res
     let entered = state.safety_epoch();
     {
         let mut cfg = state.config.lock();
-        if cfg.profile(&id).is_none() {
-            return Err(format!("unknown profile: {id}"));
-        }
-        cfg.selected_profile = id.clone();
-        if let Some(layout) = cfg.profile(&id).map(|p| p.layout.clone()) {
-            cfg.selected_layout = layout;
-        }
+        // Common activation policy (HF-06): selection syncs selected_layout.
+        cfg.activate_profile(&id)?;
     }
     if state.safety.epoch() != entered {
         // Stale selection must not re-apply a disabled set after the unlock.
@@ -67,8 +63,11 @@ pub fn create_profile(
     if name.is_empty() {
         return Err("profile name is required".into());
     }
-    let id = unique_id(name);
     let layout = state.config.lock().selected_layout.clone();
+    let id = {
+        let cfg = state.config.lock();
+        unique_id(name, &cfg.profiles)
+    };
     let profile = Profile {
         id: id.clone(),
         name: name.to_string(),
@@ -77,8 +76,12 @@ pub fn create_profile(
         builtin: false,
     };
     let entered = state.safety_epoch();
-    state.config.lock().profiles.push(profile.clone());
-    state.config.lock().selected_profile = id;
+    {
+        let mut cfg = state.config.lock();
+        cfg.profiles.push(profile.clone());
+        // Common activation policy (HF-06).
+        cfg.activate_profile(&id)?;
+    }
     if state.safety.epoch() != entered {
         // The profile itself is harmless (no disabled keys); only the
         // selection is reverted to the safe state.
@@ -108,16 +111,27 @@ pub fn duplicate_profile(
         .profile(&id)
         .cloned()
         .ok_or_else(|| format!("unknown profile: {id}"))?;
+    let copy_id = {
+        let cfg = state.config.lock();
+        unique_id(&source.name, &cfg.profiles)
+    };
     let copy = Profile {
-        id: unique_id(&source.name),
+        id: copy_id.clone(),
         name: format!("{} Copy", source.name),
         layout: source.layout,
         disabled_keys: source.disabled_keys,
         builtin: false,
     };
     let entered = state.safety_epoch();
-    state.config.lock().profiles.push(copy.clone());
-    state.config.lock().selected_profile = copy.id.clone();
+    {
+        let mut cfg = state.config.lock();
+        cfg.profiles.push(copy.clone());
+        // Common activation policy (HF-06): the duplicate's own layout
+        // becomes selected_layout. This was the reported invariant break:
+        // selected_profile pointed at the copy while selected_layout still
+        // showed the source's old layout context.
+        cfg.activate_profile(&copy_id)?;
+    }
     if state.safety.epoch() != entered {
         // A stale duplicate may carry a disabled set; never apply it after
         // the unlock. The copy itself stays in the list, unselected.
@@ -181,10 +195,9 @@ pub fn delete_profile(app: AppHandle, state: State<AppState>, id: String) -> Res
         }
         cfg.profiles.retain(|p| p.id != id);
         if cfg.selected_profile == id {
-            cfg.selected_profile = DEFAULT_PROFILE_ID.to_string();
-            if let Some(layout) = cfg.profile(DEFAULT_PROFILE_ID).map(|p| p.layout.clone()) {
-                cfg.selected_layout = layout;
-            }
+            // Common activation policy (HF-06), best-effort: fall back to
+            // Default and sync its layout.
+            let _ = cfg.activate_profile(DEFAULT_PROFILE_ID);
         }
     }
     if state.safety.epoch() != entered {
@@ -247,21 +260,35 @@ pub fn reset_profile(app: AppHandle, state: State<AppState>, id: String) -> Resu
     Ok(profile)
 }
 
-fn unique_id(name: &str) -> String {
+/// Collision-resistant profile id (HF-06): millisecond timestamps alone
+/// can collide when two profiles are created in the same millisecond, so
+/// the id mixes a process-wide atomic counter and the process id, and the
+/// caller verifies uniqueness against the profiles already on file.
+static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_id(name: &str, existing: &[Profile]) -> String {
     let slug: String = name
         .to_lowercase()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .take(24)
         .collect();
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
     let slug = if slug.is_empty() {
         "profile".to_string()
     } else {
         slug
     };
-    format!("{slug}-{stamp}")
+    let pid = std::process::id();
+    loop {
+        let ctr = ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let id = format!("{slug}-{nanos:x}-{pid}-{ctr}");
+        if !existing.iter().any(|p| p.id == id) {
+            return id;
+        }
+        // Practically unreachable: nanos + pid + per-process counter.
+    }
 }

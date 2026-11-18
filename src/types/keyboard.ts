@@ -58,4 +58,8 @@ export interface AppSnapshot {
   catLock: boolean;
   locale: string;
   theme: string;
+  persisted: boolean;
+  persistError: string | null;
+  persistErrorKind: string | null;
+  configRevision: number;
 }
