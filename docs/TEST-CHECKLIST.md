@@ -473,14 +473,16 @@ Physical (needs the rig + two keyboards):
 
 ## Test 24 — Key remapping (S8)
 
-ADR only so far (`docs/ADR-REMAPPING.md`): no remap code exists
-yet. The automated checks below apply once the implementation
-lands; the physical checks settle the open questions in the ADR
-(§11). Nothing here is verified yet.
+Implemented (`docs/ADR-REMAPPING.md` + engine/inject/models/UI).
+Automated checks below are covered by the Rust engine tests
+(`engine.rs`, `keycodes.rs`, `models.rs`, `state.rs`) and the
+frontend contract (T11 in `scripts/test-store-contract.mjs`);
+they pass in the local harness — see the S8 report for the
+Windows CI result. The physical checks settle the open questions
+in the ADR (§11). Nothing physical is verified yet.
 
-Automated (once implemented; engine unit tests in `engine.rs`,
-frontend contract in `scripts/test-store-contract.mjs`, T11
-pattern; Windows CI):
+Automated (engine unit tests in `engine.rs`, frontend contract in
+`scripts/test-store-contract.mjs`, T11; Windows CI):
 
 - Down injects the target once; repeat injects nothing; up injects
   the target up. A source up after a rule change releases the

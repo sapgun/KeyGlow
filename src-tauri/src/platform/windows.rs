@@ -1,4 +1,4 @@
-use crate::keyboard::engine::{FilterEngine, KeyboardController};
+use crate::keyboard::engine::{FilterEngine, InjectAction, KeyboardController};
 use crate::keyboard::hook::{start_hook, HookEvent, HookHandle, HookStart};
 use crate::keyboard::{KeyCode, SafetyState};
 use crate::platform::ControllerStart;
@@ -19,8 +19,8 @@ impl KeyboardController for WindowsController {
         self.engine.lock().disable_key(key);
     }
 
-    fn enable_all(&self) {
-        self.engine.lock().enable_all();
+    fn enable_all(&self) -> Vec<InjectAction> {
+        self.engine.lock().enable_all()
     }
 
     fn is_enabled(&self, key: KeyCode) -> bool {
@@ -50,6 +50,14 @@ impl KeyboardController for WindowsController {
     fn event_sequence(&self) -> u64 {
         self.engine.lock().event_sequence()
     }
+
+    fn set_remap_rules(&self, rules: &[(KeyCode, KeyCode)]) -> Vec<InjectAction> {
+        self.engine.lock().set_remap_rules(rules)
+    }
+
+    fn flush_remaps(&self) -> Vec<InjectAction> {
+        self.engine.lock().flush_remaps()
+    }
 }
 
 pub fn start(
@@ -63,6 +71,13 @@ pub fn start(
     let controller = Arc::new(WindowsController {
         engine: engine.clone(),
     });
+
+    // S8 (D8): before the hook is installed, release anything a previous
+    // force-killed run left down. The sweep skips keys physically held
+    // right now (GetAsyncKeyState check), so it can never cancel a live
+    // hold. The ups go straight to the foreground app here — the hook is
+    // not installed yet — which is harmless for keys that are not down.
+    crate::keyboard::inject::startup_sweep();
 
     match start_hook(engine, tx, safety.clone(), safety_wake_tx) {
         Ok(HookStart { handle, exit }) => {

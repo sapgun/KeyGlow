@@ -478,6 +478,131 @@ impl KeyCode {
     }
 }
 
+/// Reverse of [`identify_key`]: the (virtual key, scan code, extended)
+/// triple that identifies this key on the wire.
+///
+/// S8: `SendInput` injects by scan code (`KEYEVENTF_SCANCODE`), so the
+/// position — not the virtual key — identifies the target. This is the
+/// same source of truth as `identify_key`, and the roundtrip test below
+/// proves `identify_key(to_vk_scan(k)) == k` for all 110 codes, including
+/// the S6 shared-VK disambiguations (0xE2/0x56 vs 0xE2/0x73, 0xDC/0x2B
+/// vs 0xDC/0x7D). Scan codes are PS/2 set 1.
+pub fn to_vk_scan(code: KeyCode) -> (u32, u32, bool) {
+    use KeyCode::*;
+    match code {
+        Escape => (0x1B, 0x01, false),
+        F1 => (0x70, 0x3B, false),
+        F2 => (0x71, 0x3C, false),
+        F3 => (0x72, 0x3D, false),
+        F4 => (0x73, 0x3E, false),
+        F5 => (0x74, 0x3F, false),
+        F6 => (0x75, 0x40, false),
+        F7 => (0x76, 0x41, false),
+        F8 => (0x77, 0x42, false),
+        F9 => (0x78, 0x43, false),
+        F10 => (0x79, 0x44, false),
+        F11 => (0x7A, 0x57, false),
+        F12 => (0x7B, 0x58, false),
+        PrintScreen => (0x2C, 0x37, true),
+        ScrollLock => (0x91, 0x46, false),
+        Pause => (0x13, 0x45, false),
+        Backquote => (0xC0, 0x29, false),
+        Digit1 => (0x31, 0x02, false),
+        Digit2 => (0x32, 0x03, false),
+        Digit3 => (0x33, 0x04, false),
+        Digit4 => (0x34, 0x05, false),
+        Digit5 => (0x35, 0x06, false),
+        Digit6 => (0x36, 0x07, false),
+        Digit7 => (0x37, 0x08, false),
+        Digit8 => (0x38, 0x09, false),
+        Digit9 => (0x39, 0x0A, false),
+        Digit0 => (0x30, 0x0B, false),
+        Minus => (0xBD, 0x0C, false),
+        Equal => (0xBB, 0x0D, false),
+        Backspace => (0x08, 0x0E, false),
+        Tab => (0x09, 0x0F, false),
+        KeyQ => (0x51, 0x10, false),
+        KeyW => (0x57, 0x11, false),
+        KeyE => (0x45, 0x12, false),
+        KeyR => (0x52, 0x13, false),
+        KeyT => (0x54, 0x14, false),
+        KeyY => (0x59, 0x15, false),
+        KeyU => (0x55, 0x16, false),
+        KeyI => (0x49, 0x17, false),
+        KeyO => (0x4F, 0x18, false),
+        KeyP => (0x50, 0x19, false),
+        BracketLeft => (0xDB, 0x1A, false),
+        BracketRight => (0xDD, 0x1B, false),
+        Backslash => (0xDC, 0x2B, false),
+        CapsLock => (0x14, 0x3A, false),
+        KeyA => (0x41, 0x1E, false),
+        KeyS => (0x53, 0x1F, false),
+        KeyD => (0x44, 0x20, false),
+        KeyF => (0x46, 0x21, false),
+        KeyG => (0x47, 0x22, false),
+        KeyH => (0x48, 0x23, false),
+        KeyJ => (0x4A, 0x24, false),
+        KeyK => (0x4B, 0x25, false),
+        KeyL => (0x4C, 0x26, false),
+        Semicolon => (0xBA, 0x27, false),
+        Quote => (0xDE, 0x28, false),
+        Enter => (0x0D, 0x1C, false),
+        ShiftLeft => (0xA0, 0x2A, false),
+        KeyZ => (0x5A, 0x2C, false),
+        KeyX => (0x58, 0x2D, false),
+        KeyC => (0x43, 0x2E, false),
+        KeyV => (0x56, 0x2F, false),
+        KeyB => (0x42, 0x30, false),
+        KeyN => (0x4E, 0x31, false),
+        KeyM => (0x4D, 0x32, false),
+        Comma => (0xBC, 0x33, false),
+        Period => (0xBE, 0x34, false),
+        Slash => (0xBF, 0x35, false),
+        ShiftRight => (0xA1, 0x36, false),
+        ControlLeft => (0xA2, 0x1D, false),
+        MetaLeft => (0x5B, 0x5B, true),
+        AltLeft => (0xA4, 0x38, false),
+        Space => (0x20, 0x39, false),
+        AltRight => (0xA5, 0x38, true),
+        MetaRight => (0x5C, 0x5C, true),
+        ContextMenu => (0x5D, 0x5D, true),
+        ControlRight => (0xA3, 0x1D, true),
+        Insert => (0x2D, 0x52, true),
+        Delete => (0x2E, 0x53, true),
+        Home => (0x24, 0x47, true),
+        End => (0x23, 0x4F, true),
+        PageUp => (0x21, 0x49, true),
+        PageDown => (0x22, 0x51, true),
+        ArrowLeft => (0x25, 0x4B, true),
+        ArrowUp => (0x26, 0x48, true),
+        ArrowRight => (0x27, 0x4D, true),
+        ArrowDown => (0x28, 0x50, true),
+        NumLock => (0x90, 0x45, false),
+        NumpadDivide => (0x6F, 0x35, true),
+        NumpadMultiply => (0x6A, 0x37, false),
+        NumpadSubtract => (0x6D, 0x4A, false),
+        NumpadAdd => (0x6B, 0x4E, false),
+        Numpad0 => (0x60, 0x52, false),
+        Numpad1 => (0x61, 0x4F, false),
+        Numpad2 => (0x62, 0x50, false),
+        Numpad3 => (0x63, 0x51, false),
+        Numpad4 => (0x64, 0x4B, false),
+        Numpad5 => (0x65, 0x4C, false),
+        Numpad6 => (0x66, 0x4D, false),
+        Numpad7 => (0x67, 0x47, false),
+        Numpad8 => (0x68, 0x48, false),
+        Numpad9 => (0x69, 0x49, false),
+        NumpadDecimal => (0x6E, 0x53, false),
+        NumpadEnter => (0x0D, 0x1C, true),
+        IntlBackslash => (0xE2, 0x56, false),
+        IntlYen => (0xDC, 0x7D, false),
+        IntlRo => (0xE2, 0x73, false),
+        Convert => (0x1C, 0x79, false),
+        NonConvert => (0x1D, 0x7B, false),
+        KanaMode => (0x15, 0x70, false),
+    }
+}
+
 /// Map a low-level Windows key event to a stable KeyGlow identifier.
 ///
 /// Left/right modifiers are distinguished using the virtual-key when Windows
@@ -689,6 +814,21 @@ mod tests {
         assert_eq!(identify_key(0x70, 0x3B, false), Some(KeyCode::F1));
         assert_eq!(identify_key(0x20, 0x39, false), Some(KeyCode::Space));
         assert_eq!(identify_key(0xFF, 0x00, false), None);
+    }
+
+    #[test]
+    fn reverse_table_roundtrips_all_codes() {
+        // S8 (ADR §2, D4): the SendInput reverse table and the hook's
+        // forward table are the same source of truth. Every code must
+        // survive the round trip, including the S6 shared-VK splits.
+        for code in KeyCode::ALL {
+            let (vk, scan, extended) = to_vk_scan(code);
+            assert_eq!(
+                identify_key(vk, scan, extended),
+                Some(code),
+                "{code:?} (vk {vk:#x}, scan {scan:#x}, ext {extended}) did not round-trip"
+            );
+        }
     }
 
     #[test]

@@ -39,7 +39,12 @@ KeyGlow
 | `PostThreadMessageW(WM_QUIT)` | Ask the hook thread to exit |
 | `KBDLLHOOKSTRUCT` (`vkCode`, `scanCode`, `flags`) | Identify the physical key |
 
-No registry remapping, no kernel driver, no `MapVirtualKey` injection, and no `SendInput` in v0.1.
+| `SendInput` | Inject a remapped target key (S8; scancode, one `INPUT` per event, synchronous in the callback) |
+| `GetAsyncKeyState` | Startup stuck-key sweep: skip keys reported as physically held (S8) |
+
+No registry remapping, no kernel driver, no `MapVirtualKey` injection.
+`SendInput` arrived with S8 remapping (userspace only); it is the only
+synthetic-input API in the app.
 
 ## How a disabled key is intercepted
 
@@ -529,8 +534,12 @@ Detection limits (documented honestly, not claimed otherwise):
 
 ## ADR: key remapping (S8)
 
-ADR only; no product code. Full decisions in
-`docs/ADR-REMAPPING.md`. Headlines:
+Implemented (PR `codex/feature-s8-remapping`): `keyboard/engine.rs`
+(remap rules, held mapping, target refcount), `keyboard/inject.rs`
+(`SendInput` + startup sweep), `profiles/models.rs` (validation +
+load-time revalidation), `commands/profiles.rs`
+(`save_remap_rule` / `delete_remap_rule`), `components/RemapPanel.tsx`.
+Full decisions in `docs/ADR-REMAPPING.md`. Headlines:
 
 - **Scope:** 1:1 single-key remaps, per-profile rules, session-global
   (not per-device). Chord remaps, macros, layers are S9. No driver,

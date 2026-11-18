@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Keyboard } from "./components/Keyboard/Keyboard";
 import { AppRulesPanel } from "./components/AppRulesPanel";
+import { RemapPanel } from "./components/RemapPanel";
 import { LayoutSelector } from "./components/LayoutSelector";
 import { LayoutImportDialog } from "./components/LayoutImportDialog";
 import { Onboarding } from "./components/Onboarding";
@@ -271,6 +272,13 @@ export default function App() {
           onDelete={store.removeAppRule}
           onToggleAuto={store.setAutoProfileEnabled}
           onResume={store.resumeAuto}
+        />
+
+        <RemapPanel
+          rules={profile?.remappings ?? []}
+          layout={layout}
+          onSave={store.saveRemapRule}
+          onDelete={store.removeRemapRule}
         />
 
         <div className="mt-3 flex flex-shrink-0 flex-wrap items-center justify-between gap-3">

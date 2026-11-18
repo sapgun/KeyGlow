@@ -11,6 +11,7 @@ import type {
   KeyboardLayout,
   PressedSnapshot,
   Profile,
+  RemapRule,
   StateChangedPayload,
 } from "../types/keyboard";
 
@@ -89,6 +90,15 @@ export function getAppProfileStatus() {
 
 export function saveAppRule(rule: AppRule) {
   return invoke<AppRule>("save_app_rule", { rule });
+}
+
+// S8: remap rules (1:1, per profile). The backend validates and persists.
+export function saveRemapRule(rule: RemapRule) {
+  return invoke<void>("save_remap_rule", { rule });
+}
+
+export function deleteRemapRule(from: string) {
+  return invoke<void>("delete_remap_rule", { from });
 }
 
 export function deleteAppRule(id: string) {

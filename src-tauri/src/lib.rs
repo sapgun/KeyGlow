@@ -300,6 +300,8 @@ pub fn run() {
             get_app_rules,
             save_app_rule,
             delete_app_rule,
+            save_remap_rule,
+            delete_remap_rule,
             set_auto_profile_enabled,
             resume_auto_profile,
             get_app_profile_status,
@@ -323,6 +325,13 @@ pub fn run() {
                 .map(|p| crate::state::parse_key_ids(&p.disabled_keys))
                 .unwrap_or_default();
             backend.controller.set_disabled_keys(&keys);
+            // S8: the current profile's remap rules apply from startup
+            // (the engine is fresh, so the flush is empty).
+            let rules = config
+                .current_profile()
+                .map(|p| crate::state::parse_remap_rules(&p.remappings))
+                .unwrap_or_default();
+            let _ = backend.controller.set_remap_rules(&rules);
 
             if backend.hook_active {
                 tracing::info!("keyboard control active");

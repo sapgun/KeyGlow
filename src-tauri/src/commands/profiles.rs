@@ -1,5 +1,6 @@
 use crate::profiles::app_profiles::{validate_rule, AppRule, MatchReason};
-use crate::profiles::{Profile, DEFAULT_PROFILE_ID};
+use crate::profiles::models::RemapRule;
+use crate::profiles::{validate_remap_rule, Profile, DEFAULT_PROFILE_ID};
 use crate::state::{parse_key_ids, AppState};
 use crate::tray;
 use super::keyboard::state_changed_payload;
@@ -158,6 +159,93 @@ pub fn set_auto_profile_enabled(
     Ok(enabled)
 }
 
+/// S8: create one remap rule on a profile. Save-time validation
+/// (V1–V4) rejects with a surfaced error, never silently fixed. If the
+/// profile is effective, the new rules apply now (flush held targets
+/// first, then install); otherwise they apply when the profile becomes
+/// effective. Follows the save_app_rule stale-command pattern (P2).
+#[tauri::command]
+pub fn save_remap_rule(
+    app: AppHandle,
+    state: State<AppState>,
+    profile_id: String,
+    from: String,
+    to: String,
+) -> Result<RemapRule, String> {
+    let entered = state.safety_epoch();
+    let rule = {
+        let cfg = state.config.lock();
+        let profile = cfg
+            .profile(&profile_id)
+            .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+        validate_remap_rule(&from, &to, profile)?
+    };
+    {
+        let mut cfg = state.config.lock();
+        let profile = cfg
+            .profile_mut(&profile_id)
+            .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+        profile.remappings.push(rule.clone());
+    }
+    state.bump_runtime_revision();
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(rule);
+    }
+    if state.effective_profile_id() == profile_id {
+        state.apply_effective_profile_rules();
+    }
+    state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return Ok(rule);
+    }
+    let _ = app.emit("profile:changed", state.config.lock().clone());
+    let _ = app.emit("keyboard:state-changed", state_changed_payload(&state));
+    tracing::info!("remap rule saved: {profile_id} {} -> {}", rule.from, rule.to);
+    Ok(rule)
+}
+
+/// S8: delete one remap rule (by source) from a profile. Deleting a
+/// rule flushes held targets of the old set first (D6), so a key held
+/// while its rule is deleted releases the down-time target.
+#[tauri::command]
+pub fn delete_remap_rule(
+    app: AppHandle,
+    state: State<AppState>,
+    profile_id: String,
+    from: String,
+) -> Result<(), String> {
+    let entered = state.safety_epoch();
+    {
+        let mut cfg = state.config.lock();
+        let profile = cfg
+            .profile_mut(&profile_id)
+            .ok_or_else(|| format!("unknown profile: {profile_id}"))?;
+        if !profile.remappings.iter().any(|r| r.from == from) {
+            return Err(format!("unknown remap rule: {from}"));
+        }
+        profile.remappings.retain(|r| r.from != from);
+    }
+    state.bump_runtime_revision();
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(());
+    }
+    if state.effective_profile_id() == profile_id {
+        state.apply_effective_profile_rules();
+    }
+    state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return Ok(());
+    }
+    let _ = app.emit("profile:changed", state.config.lock().clone());
+    let _ = app.emit("keyboard:state-changed", state_changed_payload(&state));
+    tracing::info!("remap rule deleted: {profile_id} {from}");
+    Ok(())
+}
+
 /// Explicit user resume: clears the manual override and the safety pause
 /// (set by emergency), then re-evaluates the current foreground app.
 /// Runtime-only: nothing is persisted. An emergency landing mid-command
@@ -288,6 +376,7 @@ pub fn create_profile(
         name: name.to_string(),
         layout,
         disabled_keys: vec![],
+        remappings: vec![],
         builtin: false,
     };
     let entered = state.safety_epoch();
@@ -338,6 +427,9 @@ pub fn duplicate_profile(
         name: format!("{} Copy", source.name),
         layout: source.layout,
         disabled_keys: source.disabled_keys,
+        // S8: the copy inherits the source's rules (its disabled set is
+        // copied too, so V3 still holds).
+        remappings: source.remappings,
         builtin: false,
     };
     let entered = state.safety_epoch();
@@ -459,6 +551,17 @@ pub fn reset_profile(app: AppHandle, state: State<AppState>, id: String) -> Resu
         } else {
             profile.disabled_keys.clear();
         }
+        // S8 (V3): a reset must not leave a rule naming a now-disabled
+        // key. Drop the conflicting rules (loud log); the UI refresh
+        // below shows them gone.
+        let before = profile.remappings.len();
+        let disabled = profile.disabled_keys.clone();
+        profile.remappings.retain(|r| {
+            !disabled.iter().any(|k| k == &r.from) && !disabled.iter().any(|k| k == &r.to)
+        });
+        if profile.remappings.len() != before {
+            tracing::warn!("reset_profile dropped remap rules conflicting with disabled keys");
+        }
     }
     state.bump_runtime_revision();
     if state.safety.epoch() != entered {
@@ -476,6 +579,8 @@ pub fn reset_profile(app: AppHandle, state: State<AppState>, id: String) -> Resu
                 .unwrap_or_default()
         };
         state.controller.set_disabled_keys(&keys);
+        // S8: the reset may have dropped rules; re-apply the remainder.
+        state.apply_effective_profile_rules();
     }
     state.persist()?;
     if state.safety.epoch() != entered {

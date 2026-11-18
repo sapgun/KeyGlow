@@ -41,7 +41,15 @@ export interface Profile {
   name: string;
   layout: string;
   disabledKeys: string[];
+  /** 1:1 key remapping rules for this profile (S8). */
+  remappings: RemapRule[];
   builtin: boolean;
+}
+
+/** One remap rule (S8): pressing `from` sends `to` instead, 1:1. */
+export interface RemapRule {
+  from: string;
+  to: string;
 }
 
 /** One app rule (S5): foreground exe -> profile. */

@@ -469,6 +469,64 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   check("T10 delete refreshes custom layouts", eq(useAppStore.getState().customLayouts, []));
 }
 
+// ---------------------------------------------------------------- T11
+// S8: remap rule CRUD store actions drive the real invoke layer and
+// refresh the snapshot (profiles carry remappings). A pending save
+// invalidated by an emergency never pulls a stale snapshot afterwards.
+{
+  const useAppStore = await freshStore();
+  __resetInvoke();
+  const rule = { from: "KeyA", to: "KeyB" };
+  const profileWithRule = {
+    id: "default",
+    name: "Default",
+    layout: "tkl-ansi",
+    disabledKeys: [],
+    remappings: [rule],
+    builtin: true,
+  };
+  const profileWithoutRule = { ...profileWithRule, remappings: [] };
+  let saved = null;
+  __mockInvoke("save_remap_rule", (args) => {
+    saved = args.rule;
+    return undefined;
+  });
+  __mockInvoke("get_app_state", () =>
+    snap({ profiles: [profileWithRule], runtimeRevision: 7 }),
+  );
+  await useAppStore.getState().saveRemapRule(rule);
+  check("T11 save remap invokes backend", eq(saved, rule));
+  check(
+    "T11 save remap refreshes snapshot",
+    eq(useAppStore.getState().profiles[0]?.remappings, [rule]),
+  );
+  __mockInvoke("delete_remap_rule", () => undefined);
+  __mockInvoke("get_app_state", () =>
+    snap({ profiles: [profileWithoutRule], runtimeRevision: 8 }),
+  );
+  await useAppStore.getState().removeRemapRule("KeyA");
+  check(
+    "T11 delete remap refreshes snapshot",
+    eq(useAppStore.getState().profiles[0]?.remappings, []),
+  );
+
+  // Emergency floors a pending save: the post-command snapshot pull still
+  // happens (same as saveAppRule), but its result is dropped — the stale
+  // snapshot must not overwrite the post-emergency state.
+  __resetInvoke();
+  const d = deferred();
+  __mockInvoke("save_remap_rule", () => d.promise);
+  __mockInvoke("get_app_state", () =>
+    Promise.resolve(snap({ profiles: [], runtimeRevision: 1 })),
+  );
+  const p = useAppStore.getState().saveRemapRule({ from: "KeyC", to: "KeyD" });
+  useAppStore.getState().showEmergency({ epoch: 6, runtimeRevision: 101 });
+  d.resolve(undefined);
+  await p;
+  check("T11 stale post-save snapshot dropped", eq(useAppStore.getState().profiles, [profileWithoutRule]));
+  check("T11 emergency floor holds profile", useAppStore.getState().profileId === "default");
+}
+
 console.log(`\n${passed} assertions passed`);
 // The store arms 8s stale-check timers (PRESS_STALE_CHECK_MS); they keep
 // the event loop alive long after the tests finish. Exit explicitly.

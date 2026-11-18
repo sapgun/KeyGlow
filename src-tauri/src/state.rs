@@ -115,9 +115,14 @@ impl AppState {
             .current_profile()
             .map(|p| parse_key_ids(&p.disabled_keys))
             .unwrap_or_default();
+        let rules = cfg
+            .current_profile()
+            .map(|p| parse_remap_rules(&p.remappings))
+            .unwrap_or_default();
         drop(cfg);
         self.controller.set_disabled_keys(&keys);
         debug_assert!(keys.iter().all(|key| !self.controller.is_enabled(*key)));
+        self.apply_remap_rules(&rules);
     }
 
     pub fn snapshot_disabled(&self) -> Vec<String> {
@@ -140,7 +145,14 @@ impl AppState {
         // Physical recovery already happened in the hook thread; re-assert
         // here so config/UI convergence can never re-block input, even when
         // the settings file cannot be written.
-        self.controller.enable_all();
+        // S8: enable_all flushes held remap targets; execute the ups so
+        // no injected key sticks after the unlock.
+        let flushed = self.controller.enable_all();
+        if !flushed.is_empty() {
+            if let Err(err) = crate::keyboard::inject::execute_injections(&flushed) {
+                tracing::error!("emergency remap flush failed ({err}); a remapped key may stick");
+            }
+        }
         {
             let mut cfg = self.config.lock();
             // Common activation policy (HF-06), best-effort: the unlock
@@ -155,6 +167,10 @@ impl AppState {
                 profile.disabled_keys.clear();
             }
         }
+        // S8: after the emergency the effective profile is Default, so
+        // Default's rules apply (the pre-emergency profile's rules return
+        // only on explicit resume, exactly like its disabled keys).
+        self.apply_profile_rules(DEFAULT_PROFILE_ID);
         // S5: the emergency pauses automation and drops any manual
         // override. The effective profile becomes Default with the
         // safety-paused reason; no auto-switch can undo the unlock until
@@ -215,6 +231,31 @@ impl AppState {
         )
     }
 
+    /// S8: install a rule set on the controller (flush first, then
+    /// install) and execute the flush injections. Called whenever the
+    /// effective profile's rules change: profile switches, rule CRUD,
+    /// emergency fallback. `SendInput` is callable from any thread, so
+    /// this runs on command/worker threads as well as the hook thread.
+    fn apply_remap_rules(&self, rules: &[(KeyCode, KeyCode)]) {
+        let flushed = self.controller.set_remap_rules(rules);
+        if !flushed.is_empty() {
+            if let Err(err) = crate::keyboard::inject::execute_injections(&flushed) {
+                tracing::error!("remap flush failed ({err}); a remapped key may stick");
+            }
+        }
+    }
+
+    /// S8: install one profile's rules by id (flush + apply).
+    fn apply_profile_rules(&self, profile_id: &str) {
+        let rules = {
+            let cfg = self.config.lock();
+            cfg.profile(profile_id)
+                .map(|p| parse_remap_rules(&p.remappings))
+                .unwrap_or_default()
+        };
+        self.apply_remap_rules(&rules);
+    }
+
     /// Apply one profile's disabled keys to the controller. Runtime-only:
     /// no config write, no disk write.
     fn apply_profile_keys(&self, profile_id: &str) {
@@ -225,6 +266,9 @@ impl AppState {
                 .unwrap_or_default()
         };
         self.controller.set_disabled_keys(&keys);
+        // S8: the same switch applies the profile's remap rules (flush
+        // old held targets first, then install the new set).
+        self.apply_profile_rules(profile_id);
     }
 
     /// Apply the current effective profile's keys (after a manual
@@ -232,6 +276,12 @@ impl AppState {
     pub fn apply_effective_profile_keys(&self) {
         let id = self.effective_profile_id();
         self.apply_profile_keys(&id);
+    }
+
+    /// S8: re-apply the effective profile's remap rules (flush + install).
+    pub fn apply_effective_profile_rules(&self) {
+        let id = self.effective_profile_id();
+        self.apply_profile_rules(&id);
     }
 
     /// Record a manual profile selection in the runtime: it outranks app
@@ -315,6 +365,23 @@ pub fn parse_key_ids(ids: &[String]) -> Vec<KeyCode> {
     ids.iter().filter_map(|id| KeyCode::from_id(id)).collect()
 }
 
+/// S8: parse a profile's stored remap rules into engine pairs. Invalid
+/// ids were already dropped by `normalize`; this is a defensive second
+/// filter for rules built in memory.
+pub fn parse_remap_rules(rules: &[crate::profiles::RemapRule]) -> Vec<(KeyCode, KeyCode)> {
+    rules
+        .iter()
+        .filter_map(|r| {
+            let from = KeyCode::from_id(&r.from)?;
+            let to = KeyCode::from_id(&r.to)?;
+            if from == to {
+                return None;
+            }
+            Some((from, to))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,8 +399,8 @@ mod tests {
         fn disable_key(&self, key: KeyCode) {
             self.engine.lock().disable_key(key);
         }
-        fn enable_all(&self) {
-            self.engine.lock().enable_all();
+        fn enable_all(&self) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().enable_all()
         }
         fn is_enabled(&self, key: KeyCode) -> bool {
             self.engine.lock().is_enabled(key)
@@ -356,13 +423,23 @@ mod tests {
         fn event_sequence(&self) -> u64 {
             self.engine.lock().event_sequence()
         }
+        fn set_remap_rules(
+            &self,
+            rules: &[(KeyCode, KeyCode)],
+        ) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().set_remap_rules(rules)
+        }
+        fn flush_remaps(&self) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().flush_remaps()
+        }
     }
 
-    fn test_state(config_path: PathBuf) -> AppState {
-        AppState {
-            controller: Arc::new(TestController {
-                engine: Mutex::new(FilterEngine::new()),
-            }),
+    fn test_state_with_controller(config_path: PathBuf) -> (AppState, Arc<TestController>) {
+        let controller = Arc::new(TestController {
+            engine: Mutex::new(FilterEngine::new()),
+        });
+        let state = AppState {
+            controller: controller.clone(),
             config: Mutex::new(AppConfig::default()),
             config_path,
             hook_active: AtomicBool::new(false),
@@ -375,7 +452,12 @@ mod tests {
             persist_error: Mutex::new(None),
             persist_error_kind: Mutex::new(None),
             app_profiles: Mutex::new(AppProfileRuntime::new(DEFAULT_PROFILE_ID)),
-        }
+        };
+        (state, controller)
+    }
+
+    fn test_state(config_path: PathBuf) -> AppState {
+        test_state_with_controller(config_path).0
     }
 
     fn unique_temp_path(tag: &str) -> PathBuf {
@@ -764,6 +846,131 @@ mod tests {
         assert_eq!(change.profile_id, "default");
         assert_eq!(change.reason, MatchReason::Default);
         assert_eq!(state.effective_profile_id(), "default");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- S8: remap rule wiring ----
+
+    use crate::keyboard::engine::{HookDecision, InjectAction, KeyPhase};
+    use crate::profiles::RemapRule;
+
+    fn set_profile_rules(state: &AppState, profile_id: &str, rules: Vec<RemapRule>) {
+        state
+            .config
+            .lock()
+            .profile_mut(profile_id)
+            .unwrap()
+            .remappings = rules;
+    }
+
+    #[test]
+    fn profile_switch_installs_rules_and_flushes_held() {
+        let dir = unique_temp_path("s8_switch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (state, controller) = test_state_with_controller(dir.join("settings.json"));
+        set_profile_rules(
+            &state,
+            "gaming",
+            vec![RemapRule {
+                from: "KeyA".into(),
+                to: "KeyB".into(),
+            }],
+        );
+        {
+            let mut cfg = state.config.lock();
+            cfg.activate_profile("gaming").unwrap();
+        }
+        state.apply_current_profile();
+        assert_eq!(
+            controller.engine.lock().remap_rules(),
+            vec![(KeyCode::KeyA, KeyCode::KeyB)]
+        );
+        // Hold A: the target is injected.
+        let result = controller
+            .engine
+            .lock()
+            .process(KeyCode::KeyA, KeyPhase::Down);
+        assert_eq!(result.inject, vec![InjectAction::Down(KeyCode::KeyB)]);
+        // Switch to Default (no rules) mid-hold: the held target is
+        // flushed (execute_injections is a stub off Windows, but the
+        // engine state is released) and the new rules install.
+        {
+            let mut cfg = state.config.lock();
+            cfg.activate_profile(DEFAULT_PROFILE_ID).unwrap();
+        }
+        state.apply_current_profile();
+        assert!(controller.engine.lock().remap_rules().is_empty());
+        assert!(controller.engine.lock().flush_remaps().is_empty());
+        // The held A's release injects nothing (already flushed).
+        let release = controller
+            .engine
+            .lock()
+            .process(KeyCode::KeyA, KeyPhase::Up);
+        assert!(release.inject.is_empty());
+        // The next A press forwards normally.
+        let again = controller
+            .engine
+            .lock()
+            .process(KeyCode::KeyA, KeyPhase::Down);
+        assert_eq!(again.decision, HookDecision::Forward);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emergency_falls_back_to_default_rules() {
+        let dir = unique_temp_path("s8_emergency");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (state, controller) = test_state_with_controller(dir.join("settings.json"));
+        set_profile_rules(
+            &state,
+            "gaming",
+            vec![RemapRule {
+                from: "KeyA".into(),
+                to: "KeyB".into(),
+            }],
+        );
+        set_profile_rules(
+            &state,
+            DEFAULT_PROFILE_ID,
+            vec![RemapRule {
+                from: "KeyC".into(),
+                to: "KeyD".into(),
+            }],
+        );
+        {
+            let mut cfg = state.config.lock();
+            cfg.activate_profile("gaming").unwrap();
+        }
+        state.apply_current_profile();
+        assert_eq!(
+            controller.engine.lock().remap_rules(),
+            vec![(KeyCode::KeyA, KeyCode::KeyB)]
+        );
+        // Hold A under Gaming's rule.
+        let held = controller
+            .engine
+            .lock()
+            .process(KeyCode::KeyA, KeyPhase::Down);
+        assert_eq!(held.inject, vec![InjectAction::Down(KeyCode::KeyB)]);
+        // Emergency: held target flushed, Default's rules installed.
+        state.emergency_unlock();
+        assert_eq!(state.config.lock().selected_profile, DEFAULT_PROFILE_ID);
+        assert_eq!(
+            controller.engine.lock().remap_rules(),
+            vec![(KeyCode::KeyC, KeyCode::KeyD)]
+        );
+        assert!(controller.engine.lock().flush_remaps().is_empty());
+        // A's release injects nothing (already flushed); C remaps now.
+        let release = controller
+            .engine
+            .lock()
+            .process(KeyCode::KeyA, KeyPhase::Up);
+        assert!(release.inject.is_empty());
+        let remapped = controller
+            .engine
+            .lock()
+            .process(KeyCode::KeyC, KeyPhase::Down);
+        assert_eq!(remapped.inject, vec![InjectAction::Down(KeyCode::KeyD)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

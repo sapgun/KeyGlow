@@ -9,6 +9,74 @@ pub const CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_LAYOUT: &str = "tkl-ansi";
 pub const DEFAULT_PROFILE_ID: &str = "default";
 
+/// S8: one key remap rule (ADR-REMAPPING.md §7). Stored as key ids
+/// (`KeyCode::as_str`), same id space as `disabled_keys`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemapRule {
+    pub from: String,
+    pub to: String,
+}
+
+/// Toggle keys (S8 V4): excluded as remap *targets* — injecting a
+/// toggle down flips LED state the engine does not track. Allowed as
+/// sources.
+pub const TOGGLE_KEYS: [&str; 3] = ["CapsLock", "NumLock", "ScrollLock"];
+
+pub fn is_toggle_key(id: &str) -> bool {
+    TOGGLE_KEYS.contains(&id)
+}
+
+/// S8 validation (ADR §7, V1–V4) for one new rule against a profile's
+/// current rules and disabled keys. Save-time rejection: never silently
+/// fixed. Load-time cleaning in `normalize` drops invalid rules instead.
+pub fn validate_remap_rule(
+    from: &str,
+    to: &str,
+    profile: &Profile,
+) -> Result<RemapRule, String> {
+    let from_code = KeyCode::from_id(from).ok_or_else(|| format!("unknown key: {from}"))?;
+    let to_code = KeyCode::from_id(to).ok_or_else(|| format!("unknown key: {to}"))?;
+    let _ = (from_code, to_code);
+    // V1: well-formed.
+    if from == to {
+        return Err(format!("cannot remap {from} to itself"));
+    }
+    // V4: Pause has no distinct key-up, so it cannot pair a release.
+    if from == "Pause" || to == "Pause" {
+        return Err("Pause cannot be remapped (it has no key-up to pair)".into());
+    }
+    // V4: toggle keys are excluded as targets.
+    if is_toggle_key(to) {
+        return Err(format!("{to} cannot be a remap target (toggle key)"));
+    }
+    // V2: one rule per source per profile.
+    if profile.remappings.iter().any(|r| r.from == from) {
+        return Err(format!("{from} already has a remap rule; delete it first"));
+    }
+    // V3: neither participant may be disabled in this profile.
+    if profile.disabled_keys.iter().any(|k| k == from) {
+        return Err(format!("{from} is disabled in this profile; enable it first"));
+    }
+    if profile.disabled_keys.iter().any(|k| k == to) {
+        return Err(format!("{to} is disabled in this profile; enable it first"));
+    }
+    Ok(RemapRule {
+        from: from.to_string(),
+        to: to.to_string(),
+    })
+}
+
+/// S8: does `code` participate in any rule of this profile (source or
+/// target)? Used by the disable command (V3, second direction).
+pub fn remap_participant(profile: &Profile, code: &str) -> Option<RemapRule> {
+    profile
+        .remappings
+        .iter()
+        .find(|r| r.from == code || r.to == code)
+        .cloned()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
@@ -17,6 +85,10 @@ pub struct Profile {
     pub layout: String,
     #[serde(default)]
     pub disabled_keys: Vec<String>,
+    /// S8: 1:1 key remap rules for this profile. Additive, config
+    /// version stays 1; old files load with an empty list.
+    #[serde(default)]
+    pub remappings: Vec<RemapRule>,
     #[serde(default)]
     pub builtin: bool,
 }
@@ -103,6 +175,7 @@ pub fn builtin_profiles() -> Vec<Profile> {
             name: "Default".into(),
             layout: DEFAULT_LAYOUT.into(),
             disabled_keys: vec![],
+            remappings: vec![],
             builtin: true,
         },
         Profile {
@@ -110,6 +183,7 @@ pub fn builtin_profiles() -> Vec<Profile> {
             name: "Gaming".into(),
             layout: DEFAULT_LAYOUT.into(),
             disabled_keys: vec!["MetaLeft".into(), "MetaRight".into()],
+            remappings: vec![],
             builtin: true,
         },
         Profile {
@@ -117,6 +191,7 @@ pub fn builtin_profiles() -> Vec<Profile> {
             name: "Coding".into(),
             layout: DEFAULT_LAYOUT.into(),
             disabled_keys: vec![],
+            remappings: vec![],
             builtin: true,
         },
     ]
@@ -128,6 +203,7 @@ fn default_profile_entry() -> Profile {
         name: "Default".into(),
         layout: DEFAULT_LAYOUT.into(),
         disabled_keys: vec![],
+        remappings: vec![],
         builtin: true,
     }
 }
@@ -206,6 +282,41 @@ impl AppConfig {
             }
             profile.disabled_keys.sort();
             profile.disabled_keys.dedup();
+            // S8: a stored rule that no longer validates is dropped at
+            // load and the rest of the profile is kept (ADR §7). Same
+            // checks as save-time validation, minus the duplicate-source
+            // test (handled by first-occurrence retention below).
+            let before_rules = profile.remappings.len();
+            let disabled = profile.disabled_keys.clone();
+            let profile_id = profile.id.clone();
+            let mut seen_sources = HashSet::new();
+            let cleaned: Vec<RemapRule> = profile
+                .remappings
+                .drain(..)
+                .filter(|r| {
+                    let ok = KeyCode::from_id(&r.from).is_some()
+                        && KeyCode::from_id(&r.to).is_some()
+                        && r.from != r.to
+                        && r.from != "Pause"
+                        && r.to != "Pause"
+                        && !is_toggle_key(&r.to)
+                        && !disabled.iter().any(|k| k == &r.from)
+                        && !disabled.iter().any(|k| k == &r.to)
+                        && seen_sources.insert(r.from.clone());
+                    if !ok {
+                        tracing::warn!(
+                            "profile {profile_id} had an invalid remap rule {} -> {}; removed",
+                            r.from,
+                            r.to
+                        );
+                    }
+                    ok
+                })
+                .collect();
+            profile.remappings = cleaned;
+            if profile.remappings.len() != before_rules {
+                tracing::warn!("profile {profile_id} remap rules cleaned during normalize");
+            }
         }
         // Selected profile must exist.
         if !self.profiles.iter().any(|p| p.id == self.selected_profile) {
@@ -372,6 +483,7 @@ mod tests {
             name: "Wide".into(),
             layout: "fullsize-ansi".into(),
             disabled_keys: vec![],
+            remappings: vec![],
             builtin: false,
         });
         cfg.activate_profile("wide").unwrap();
@@ -396,6 +508,7 @@ mod tests {
             name: "ISO user".into(),
             layout: "my-iso".into(),
             disabled_keys: vec![],
+            remappings: vec![],
             builtin: false,
         });
         let cfg = cfg.normalize();
@@ -426,6 +539,7 @@ mod tests {
             name: "JIS user".into(),
             layout: "my-jis".into(),
             disabled_keys: vec![],
+            remappings: vec![],
             builtin: false,
         });
         let cfg = cfg.normalize();
@@ -450,5 +564,129 @@ mod tests {
         // selected custom profile is preserved; Default is available.
         assert_eq!(cfg.selected_profile, "custom");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- S8: remap rule validation (ADR §7, V1–V5) ----
+
+    fn rule_profile() -> Profile {
+        Profile {
+            id: "test".into(),
+            name: "Test".into(),
+            layout: DEFAULT_LAYOUT.into(),
+            disabled_keys: vec![],
+            remappings: vec![],
+            builtin: false,
+        }
+    }
+
+    #[test]
+    fn remap_validation_accepts_plain_rule_and_rejects_v1_v2_v4() {
+        let mut profile = rule_profile();
+        // Plain rule: accepted.
+        let rule = validate_remap_rule("KeyA", "KeyB", &profile).unwrap();
+        assert_eq!(rule.from, "KeyA");
+        assert_eq!(rule.to, "KeyB");
+        profile.remappings.push(rule);
+        // V1: self-map.
+        assert!(validate_remap_rule("KeyA", "KeyA", &profile).is_err());
+        // V1: unknown ids.
+        assert!(validate_remap_rule("KeyA", "NotAKey", &profile).is_err());
+        assert!(validate_remap_rule("NotAKey", "KeyB", &profile).is_err());
+        // V2: duplicate source.
+        assert!(validate_remap_rule("KeyA", "KeyC", &profile).is_err());
+        // V4: Pause either way.
+        assert!(validate_remap_rule("Pause", "KeyB", &profile).is_err());
+        assert!(validate_remap_rule("KeyA", "Pause", &profile).is_err());
+        // V4: toggle keys as targets, but allowed as sources.
+        for toggle in ["CapsLock", "NumLock", "ScrollLock"] {
+            assert!(
+                validate_remap_rule("KeyA", toggle, &profile).is_err(),
+                "{toggle} must be rejected as a target"
+            );
+            assert!(
+                validate_remap_rule(toggle, "KeyB", &profile).is_ok(),
+                "{toggle} must be allowed as a source"
+            );
+        }
+        // Shared targets are allowed (refcount, §3).
+        assert!(validate_remap_rule("KeyC", "KeyB", &profile).is_ok());
+    }
+
+    #[test]
+    fn remap_validation_rejects_disabled_participants_v3() {
+        let mut profile = rule_profile();
+        profile.disabled_keys = vec!["KeyA".into()];
+        assert!(validate_remap_rule("KeyA", "KeyB", &profile).is_err());
+        assert!(validate_remap_rule("KeyC", "KeyA", &profile).is_err());
+        assert!(validate_remap_rule("KeyC", "KeyB", &profile).is_ok());
+        // The reverse direction: a rule participant is found by lookup.
+        profile.disabled_keys.clear();
+        profile.remappings.push(RemapRule {
+            from: "KeyA".into(),
+            to: "KeyB".into(),
+        });
+        assert_eq!(
+            remap_participant(&profile, "KeyA").unwrap().to,
+            "KeyB"
+        );
+        assert_eq!(
+            remap_participant(&profile, "KeyB").unwrap().from,
+            "KeyA"
+        );
+        assert!(remap_participant(&profile, "KeyC").is_none());
+    }
+
+    #[test]
+    fn normalize_drops_invalid_remap_rules_and_keeps_rest() {
+        // V5: old files load with an empty list; a stored file with an
+        // invalid rule drops that rule at load and keeps the profile.
+        let raw = r#"{
+            "version": 1,
+            "selectedProfile": "default",
+            "profiles": [{
+                "id": "default", "name": "Default", "layout": "tkl-ansi",
+                "disabledKeys": ["KeyZ"],
+                "remappings": [
+                    {"from": "KeyA", "to": "KeyB"},
+                    {"from": "KeyA", "to": "KeyC"},
+                    {"from": "KeyC", "to": "KeyC"},
+                    {"from": "Pause", "to": "KeyB"},
+                    {"from": "KeyD", "to": "CapsLock"},
+                    {"from": "KeyE", "to": "NotAKey"},
+                    {"from": "KeyZ", "to": "KeyB"},
+                    {"from": "KeyF", "to": "KeyZ"},
+                    {"from": "CapsLock", "to": "ControlLeft"}
+                ]
+            }]
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(raw).unwrap();
+        let cfg = cfg.migrate();
+        let rules = &cfg.profile("default").unwrap().remappings;
+        // Kept: A->B (first source wins), CapsLock->ControlLeft (toggle
+        // source allowed). Dropped: duplicate source, self-map, Pause,
+        // toggle target, unknown id, disabled participants (KeyZ both ways).
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].from, "KeyA");
+        assert_eq!(rules[0].to, "KeyB");
+        assert_eq!(rules[1].from, "CapsLock");
+        assert_eq!(rules[1].to, "ControlLeft");
+    }
+
+    #[test]
+    fn remap_rules_roundtrip_through_json() {
+        let mut cfg = AppConfig::default();
+        cfg.profile_mut("default").unwrap().remappings.push(RemapRule {
+            from: "KeyA".into(),
+            to: "KeyB".into(),
+        });
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        let reloaded: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reloaded.profile("default").unwrap().remappings.len(), 1);
+        // Old files without the field load with an empty list (V5).
+        let old: AppConfig = serde_json::from_str(
+            r#"{"version": 1, "selectedProfile": "default", "profiles": [{"id": "default", "name": "Default", "layout": "tkl-ansi"}]}"#,
+        )
+        .unwrap();
+        assert!(old.migrate().profile("default").unwrap().remappings.is_empty());
     }
 }
