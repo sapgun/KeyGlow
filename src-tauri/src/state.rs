@@ -1,10 +1,18 @@
 use crate::keyboard::engine::KeyboardController;
 use crate::keyboard::{KeyCode, SafetyState};
+use crate::profiles::app_profiles::{
+    AppProfileRuntime, AppRule, EffectiveChange, MatchReason,
+};
+use crate::profiles::models::{LayerDef, MacroDef};
 use crate::profiles::{save, AppConfig, DEFAULT_PROFILE_ID};
 use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Stable machine-readable reason for the last persist failure, for the UI.
+pub const PERSIST_ERROR_NEWER_VERSION: &str = "newer_version";
+pub const PERSIST_ERROR_IO: &str = "io_error";
 
 pub struct AppState {
     pub controller: Arc<dyn KeyboardController>,
@@ -17,22 +25,102 @@ pub struct AppState {
     /// Also serializes mutating commands: a command that started before an
     /// emergency press observes a newer epoch and must discard its intent.
     pub safety: Arc<SafetyState>,
+    /// Serializes all settings writes: the config clone + save is one
+    /// critical section, so concurrent commands can never interleave their
+    /// writes. Lock order is always persist_lock -> config lock, never the
+    /// reverse (commands must not hold persist_lock across persist()).
+    pub(crate) persist_lock: Mutex<()>,
+    /// Incremented after every successful persist.
+    pub persisted_revision: AtomicU64,
+    /// Monotonic runtime-state revision (P3). Bumped once per runtime state
+    /// mutation (mutating commands, emergency convergence), regardless of
+    /// whether the change reached the disk. This is the ordering key the UI
+    /// uses to discard stale snapshots/events; it is deliberately distinct
+    /// from `persisted_revision`, which only tracks successful disk writes
+    /// (a best-effort emergency persist may fail while the runtime state
+    /// still changed, and some runtime state never persists at all).
+    pub runtime_revision: AtomicU64,
+    /// Last persist failure, if the on-disk config is stale.
+    pub persist_error: Mutex<Option<String>>,
+    /// Machine-readable kind of the last failure (for translated UI).
+    pub persist_error_kind: Mutex<Option<String>>,
+    /// Runtime-only app-profile state (S5): effective profile, manual
+    /// override, safety pause, match reason, foreground exe. Never
+    /// serialized, never written to disk. `config.selected_profile` stays
+    /// the manual selection; this holds what actually filters keys now.
+    pub app_profiles: Mutex<AppProfileRuntime>,
 }
 
 impl AppState {
     pub fn persist(&self) -> Result<(), String> {
+        // Single writer: concurrent commands serialize here instead of
+        // sharing a temp file or interleaving writes (HF-02).
+        let _w = self.persist_lock.lock();
+        if self.config.lock().future_version {
+            // Non-destructive fallback (HF-06): a newer version's settings
+            // are never silently downgraded to v1.
+            let err =
+                "settings were written by a newer KeyGlow version; refusing to overwrite"
+                    .to_string();
+            *self.persist_error.lock() = Some(err.clone());
+            *self.persist_error_kind.lock() = Some(PERSIST_ERROR_NEWER_VERSION.to_string());
+            return Err(err);
+        }
         let cfg = self.config.lock().clone();
-        save(&self.config_path, &cfg)
+        match save(&self.config_path, &cfg) {
+            Ok(()) => {
+                self.persisted_revision.fetch_add(1, Ordering::SeqCst);
+                *self.persist_error.lock() = None;
+                *self.persist_error_kind.lock() = None;
+                Ok(())
+            }
+            Err(err) => {
+                *self.persist_error.lock() = Some(err.clone());
+                *self.persist_error_kind.lock() = Some(PERSIST_ERROR_IO.to_string());
+                Err(err)
+            }
+        }
+    }
+
+    /// Best-effort re-save after a failure (UI "Retry" action).
+    pub fn retry_persist(&self) -> Result<(), String> {
+        self.persist()
+    }
+
+    /// Record a runtime state mutation for UI ordering (P3). Call exactly
+    /// once per mutating command / convergence, after the mutation landed.
+    pub fn bump_runtime_revision(&self) {
+        self.runtime_revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Current ordering stamp for native event payloads (P3):
+    /// (latest safety epoch, current runtime revision).
+    pub fn event_stamp(&self) -> (u64, u64) {
+        (
+            self.safety.epoch(),
+            self.runtime_revision.load(Ordering::SeqCst),
+        )
+    }
+
+    /// (persisted, last error, error kind, revision) for the UI snapshot.
+    pub fn persist_state(&self) -> (bool, Option<String>, Option<String>, u64) {
+        let err = self.persist_error.lock().clone();
+        let kind = self.persist_error_kind.lock().clone();
+        let rev = self.persisted_revision.load(Ordering::SeqCst);
+        (err.is_none(), err, kind, rev)
     }
 
     pub fn apply_current_profile(&self) {
-        let cfg = self.config.lock();
-        let keys = cfg
-            .current_profile()
-            .map(|p| parse_key_ids(&p.disabled_keys))
-            .unwrap_or_default();
-        drop(cfg);
-        self.controller.set_disabled_keys(&keys);
+        let (id, keys) = {
+            let cfg = self.config.lock();
+            let id = cfg.selected_profile.clone();
+            let keys = cfg
+                .current_profile()
+                .map(|p| parse_key_ids(&p.disabled_keys))
+                .unwrap_or_default();
+            (id, keys)
+        };
+        self.apply_profile_keys(&id);
         debug_assert!(keys.iter().all(|key| !self.controller.is_enabled(*key)));
     }
 
@@ -56,20 +144,46 @@ impl AppState {
         // Physical recovery already happened in the hook thread; re-assert
         // here so config/UI convergence can never re-block input, even when
         // the settings file cannot be written.
-        self.controller.enable_all();
+        // S8: enable_all flushes held remap targets; execute the ups so
+        // no injected key sticks after the unlock.
+        let flushed = self.controller.enable_all();
+        if !flushed.is_empty() {
+            if let Err(err) = crate::keyboard::inject::execute_injections(&flushed) {
+                tracing::error!("emergency remap flush failed ({err}); a remapped key may stick");
+            }
+        }
         {
             let mut cfg = self.config.lock();
+            // Common activation policy (HF-06), best-effort: the unlock
+            // itself must never fail. Default selection also syncs
+            // selected_layout to Default's layout.
             if cfg.profile(DEFAULT_PROFILE_ID).is_some() {
-                cfg.selected_profile = DEFAULT_PROFILE_ID.to_string();
+                if let Err(err) = cfg.activate_profile(DEFAULT_PROFILE_ID) {
+                    tracing::error!("emergency unlock: activation failed ({err})");
+                }
             }
             if let Some(profile) = cfg.current_profile_mut() {
                 profile.disabled_keys.clear();
             }
         }
+        // S8: after the emergency the effective profile is Default, so
+        // Default's rules apply (the pre-emergency profile's rules return
+        // only on explicit resume, exactly like its disabled keys). S9:
+        // Default's macros and layers apply too — the engine must not
+        // keep the pre-emergency profile's definitions.
+        self.apply_profile_keys(DEFAULT_PROFILE_ID);
+        // S5: the emergency pauses automation and drops any manual
+        // override. The effective profile becomes Default with the
+        // safety-paused reason; no auto-switch can undo the unlock until
+        // the user explicitly resumes.
+        self.app_profiles.lock().on_emergency();
+        // The runtime state changed (controller + config); order it for the
+        // UI even though the persist below is best-effort (P3).
+        self.bump_runtime_revision();
         if let Err(err) = self.persist() {
             // Best effort by design: physical keys stay enabled regardless of
-            // disk state. The error is logged, not swallowed, so a broken
-            // settings path is visible in diagnostics.
+            // disk state. The error is recorded (not swallowed) so the UI can
+            // show it with a retry action.
             tracing::error!(
                 "emergency unlock: settings persist failed ({err}); input remains enabled"
             );
@@ -82,10 +196,250 @@ impl AppState {
     pub fn safety_epoch(&self) -> u64 {
         self.safety.epoch()
     }
+
+    // ---- S5: app profiles (runtime-only effective profile) ----
+
+    /// The profile actually filtering keys right now (may differ from
+    /// `config.selected_profile` when an app rule matched).
+    pub fn effective_profile_id(&self) -> String {
+        self.app_profiles.lock().effective_profile_id().to_string()
+    }
+
+    /// (effective, manual_override, reason, safety_paused, current_exe,
+    /// runtime revision) for the snapshot / status payload.
+    pub fn app_profile_status(
+        &self,
+    ) -> (String, Option<String>, MatchReason, bool, Option<String>, u64) {
+        let rt = self.app_profiles.lock();
+        (
+            rt.effective_profile_id().to_string(),
+            rt.manual_override().map(|s| s.to_string()),
+            rt.reason(),
+            rt.safety_paused(),
+            rt.current_exe().map(|s| s.to_string()),
+            rt.revision(),
+        )
+    }
+
+    /// Snapshot the persisted inputs the resolver needs, so the runtime
+    /// lock is never held across the config lock.
+    fn rules_snapshot(&self) -> (Vec<AppRule>, bool, Vec<String>) {
+        let cfg = self.config.lock();
+        (
+            cfg.app_rules.clone(),
+            cfg.auto_profile_enabled,
+            cfg.profiles.iter().map(|p| p.id.clone()).collect(),
+        )
+    }
+
+    /// S8: install a rule set on the controller (flush first, then
+    /// install) and execute the flush injections. Called whenever the
+    /// effective profile's rules change: profile switches, rule CRUD,
+    /// emergency fallback. `SendInput` is callable from any thread, so
+    /// this runs on command/worker threads as well as the hook thread.
+    fn apply_remap_rules(&self, rules: &[(KeyCode, KeyCode)]) {
+        let flushed = self.controller.set_remap_rules(rules);
+        if !flushed.is_empty() {
+            if let Err(err) = crate::keyboard::inject::execute_injections(&flushed) {
+                tracing::error!("remap flush failed ({err}); a remapped key may stick");
+            }
+        }
+    }
+
+    /// S8: install one profile's rules by id (flush + apply).
+    fn apply_profile_rules(&self, profile_id: &str) {
+        let rules = {
+            let cfg = self.config.lock();
+            cfg.profile(profile_id)
+                .map(|p| parse_remap_rules(&p.remappings))
+                .unwrap_or_default()
+        };
+        self.apply_remap_rules(&rules);
+    }
+
+    /// Apply one profile's disabled keys to the controller. Runtime-only:
+    /// no config write, no disk write.
+    fn apply_profile_keys(&self, profile_id: &str) {
+        let (keys, macros, layers) = {
+            let cfg = self.config.lock();
+            let profile = cfg.profile(profile_id);
+            (
+                profile
+                    .map(|p| parse_key_ids(&p.disabled_keys))
+                    .unwrap_or_default(),
+                profile.map(|p| p.macros.clone()).unwrap_or_default(),
+                profile.map(|p| p.layers.clone()).unwrap_or_default(),
+            )
+        };
+        let flushed = self.controller.set_disabled_keys(&keys);
+        if !flushed.is_empty() {
+            if let Err(err) = crate::keyboard::inject::execute_injections(&flushed) {
+                tracing::error!("disabled-keys flush failed ({err}); a remapped key may stick");
+            }
+        }
+        // S8: the same switch applies the profile's remap rules (flush
+        // old held targets first, then install the new set).
+        self.apply_profile_rules(profile_id);
+        // S9: and its macros and layers (a running macro is cancelled,
+        // an active layer deactivated, before the new definitions
+        // install).
+        self.apply_macros(&macros);
+        self.apply_layers(&layers);
+    }
+
+    /// S9: install a profile's macros on the controller (a running macro
+    /// is cancelled first) and execute the releases.
+    fn apply_macros(&self, defs: &[MacroDef]) {
+        let flushed = self.controller.set_macros(defs);
+        if !flushed.is_empty() {
+            if let Err(err) = crate::keyboard::inject::execute_injections(&flushed) {
+                tracing::error!("macro cancel failed ({err}); a macro key may stick");
+            }
+        }
+    }
+
+    /// S9: install a profile's layers on the controller (an active layer
+    /// is deactivated first) and execute the flush.
+    fn apply_layers(&self, defs: &[LayerDef]) {
+        let flushed = self.controller.set_layers(defs);
+        if !flushed.is_empty() {
+            if let Err(err) = crate::keyboard::inject::execute_injections(&flushed) {
+                tracing::error!("layer switch flush failed ({err}); a remapped key may stick");
+            }
+        }
+    }
+
+    /// Apply the current effective profile's keys (after a manual
+    /// selection, delete, or resume changed it).
+    pub fn apply_effective_profile_keys(&self) {
+        let id = self.effective_profile_id();
+        self.apply_profile_keys(&id);
+    }
+
+    /// S8: re-apply the effective profile's remap rules (flush + install).
+    pub fn apply_effective_profile_rules(&self) {
+        let id = self.effective_profile_id();
+        self.apply_profile_rules(&id);
+    }
+
+    /// S9: re-apply the effective profile's macros (a running macro is
+    /// cancelled first). Used by macro CRUD; does not touch layers.
+    pub fn apply_effective_profile_macros(&self) {
+        let id = self.effective_profile_id();
+        let defs = {
+            let cfg = self.config.lock();
+            cfg.profile(&id).map(|p| p.macros.clone()).unwrap_or_default()
+        };
+        self.apply_macros(&defs);
+    }
+
+    /// S9: re-apply the effective profile's layers (an active layer is
+    /// deactivated first). Used by layer CRUD.
+    pub fn apply_effective_profile_layers(&self) {
+        let id = self.effective_profile_id();
+        let defs = {
+            let cfg = self.config.lock();
+            cfg.profile(&id).map(|p| p.layers.clone()).unwrap_or_default()
+        };
+        self.apply_layers(&defs);
+    }
+
+    /// Record a manual profile selection in the runtime: it outranks app
+    /// rules and survives foreground switches until an explicit resume.
+    /// Keys/revision are the caller's job (the profile commands already
+    /// bump and apply via `apply_current_profile`, which targets the same
+    /// profile). Returns the change, if the effective profile moved.
+    pub fn set_manual_override(&self, id: &str) -> Option<EffectiveChange> {
+        self.app_profiles.lock().set_manual(id)
+    }
+
+    /// Foreground observation (observer thread): debounce, then resolve
+    /// and apply. Returns the change, if the effective profile moved.
+    /// Never writes settings.json.
+    pub fn note_foreground(&self, exe: Option<String>, now_ms: u64) -> Option<EffectiveChange> {
+        let due = self.app_profiles.lock().note_foreground(exe, now_ms);
+        if !due {
+            return None;
+        }
+        let (rules, auto_enabled, valid_ids) = self.rules_snapshot();
+        let change = self
+            .app_profiles
+            .lock()
+            .commit(&rules, auto_enabled, &valid_ids);
+        if let Some(change) = &change {
+            self.apply_profile_keys(&change.profile_id);
+            self.bump_runtime_revision();
+        }
+        change
+    }
+
+    /// Re-evaluate the current foreground app now (rule saved/deleted,
+    /// automation toggled). Returns the change, if it moved.
+    pub fn reevaluate_foreground(&self) -> Option<EffectiveChange> {
+        let (rules, auto_enabled, valid_ids) = self.rules_snapshot();
+        let change = self
+            .app_profiles
+            .lock()
+            .force_reevaluate(&rules, auto_enabled, &valid_ids);
+        if let Some(change) = &change {
+            self.apply_profile_keys(&change.profile_id);
+            self.bump_runtime_revision();
+        }
+        change
+    }
+
+    /// User resumes automation: clears the manual override and the safety
+    /// pause, re-evaluates the current foreground app. Runtime-only.
+    pub fn resume_auto(&self) -> Option<EffectiveChange> {
+        let (rules, auto_enabled, valid_ids) = self.rules_snapshot();
+        let change = self
+            .app_profiles
+            .lock()
+            .resume_auto(&rules, auto_enabled, &valid_ids);
+        if let Some(change) = &change {
+            self.apply_profile_keys(&change.profile_id);
+            self.bump_runtime_revision();
+        }
+        change
+    }
+
+    /// A profile was deleted (rules already cleaned in config): if it was
+    /// the manual override or the effective profile, fall back.
+    pub fn sync_runtime_after_profile_delete(&self, deleted_id: &str) -> Option<EffectiveChange> {
+        let (rules, auto_enabled, valid_ids) = self.rules_snapshot();
+        let change = self.app_profiles.lock().on_profile_deleted(
+            deleted_id,
+            &rules,
+            auto_enabled,
+            &valid_ids,
+        );
+        if let Some(change) = &change {
+            self.apply_profile_keys(&change.profile_id);
+            self.bump_runtime_revision();
+        }
+        change
+    }
 }
 
 pub fn parse_key_ids(ids: &[String]) -> Vec<KeyCode> {
     ids.iter().filter_map(|id| KeyCode::from_id(id)).collect()
+}
+
+/// S8: parse a profile's stored remap rules into engine pairs. Invalid
+/// ids were already dropped by `normalize`; this is a defensive second
+/// filter for rules built in memory.
+pub fn parse_remap_rules(rules: &[crate::profiles::RemapRule]) -> Vec<(KeyCode, KeyCode)> {
+    rules
+        .iter()
+        .filter_map(|r| {
+            let from = KeyCode::from_id(&r.from)?;
+            let to = KeyCode::from_id(&r.to)?;
+            if from == to {
+                return None;
+            }
+            Some((from, to))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -105,14 +459,14 @@ mod tests {
         fn disable_key(&self, key: KeyCode) {
             self.engine.lock().disable_key(key);
         }
-        fn enable_all(&self) {
-            self.engine.lock().enable_all();
+        fn enable_all(&self) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().enable_all()
         }
         fn is_enabled(&self, key: KeyCode) -> bool {
             self.engine.lock().is_enabled(key)
         }
-        fn set_disabled_keys(&self, keys: &[KeyCode]) {
-            self.engine.lock().set_disabled_keys(keys);
+        fn set_disabled_keys(&self, keys: &[KeyCode]) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().set_disabled_keys(keys)
         }
         fn disabled_keys(&self) -> Vec<KeyCode> {
             self.engine.lock().disabled_keys()
@@ -123,20 +477,66 @@ mod tests {
         fn is_cat_locked(&self) -> bool {
             self.engine.lock().is_cat_locked()
         }
+        fn pressed_keys(&self) -> Vec<KeyCode> {
+            self.engine.lock().pressed_keys()
+        }
+        fn event_sequence(&self) -> u64 {
+            self.engine.lock().event_sequence()
+        }
+        fn set_remap_rules(
+            &self,
+            rules: &[(KeyCode, KeyCode)],
+        ) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().set_remap_rules(rules)
+        }
+        fn flush_remaps(&self) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().flush_remaps()
+        }
+        fn set_macros(&self, defs: &[MacroDef]) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().set_macros(defs)
+        }
+        fn set_layers(&self, defs: &[LayerDef]) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().set_layers(defs)
+        }
+        fn macro_tick_execute(&self, now_ms: u64) -> (bool, Option<u64>) {
+            // Tests never inject for real: advance the runner and
+            // discard the steps. Production controllers execute them.
+            let mut engine = self.engine.lock();
+            let _ = engine.macro_tick(now_ms);
+            (engine.macro_running(), engine.macro_next_due_ms())
+        }
+        fn active_layer_id(&self) -> Option<String> {
+            self.engine.lock().active_layer_id()
+        }
+        fn cancel_macro(&self) -> Vec<crate::keyboard::InjectAction> {
+            self.engine.lock().macro_cancel()
+        }
     }
 
-    fn test_state(config_path: PathBuf) -> AppState {
-        AppState {
-            controller: Arc::new(TestController {
-                engine: Mutex::new(FilterEngine::new()),
-            }),
+    fn test_state_with_controller(config_path: PathBuf) -> (AppState, Arc<TestController>) {
+        let controller = Arc::new(TestController {
+            engine: Mutex::new(FilterEngine::new()),
+        });
+        let state = AppState {
+            controller: controller.clone(),
             config: Mutex::new(AppConfig::default()),
             config_path,
             hook_active: AtomicBool::new(false),
             hook_error: Mutex::new(None),
             shutdown: Arc::new(|| {}),
             safety: Arc::new(SafetyState::new()),
-        }
+            persist_lock: Mutex::new(()),
+            persisted_revision: AtomicU64::new(0),
+            runtime_revision: AtomicU64::new(0),
+            persist_error: Mutex::new(None),
+            persist_error_kind: Mutex::new(None),
+            app_profiles: Mutex::new(AppProfileRuntime::new(DEFAULT_PROFILE_ID)),
+        };
+        (state, controller)
+    }
+
+    fn test_state(config_path: PathBuf) -> AppState {
+        test_state_with_controller(config_path).0
     }
 
     fn unique_temp_path(tag: &str) -> PathBuf {
@@ -170,6 +570,11 @@ mod tests {
         assert!(state.snapshot_disabled().is_empty());
         assert!(!state.controller.is_cat_locked());
         assert_eq!(state.config.lock().selected_profile, DEFAULT_PROFILE_ID);
+        // The failure is recorded for the UI instead of swallowed.
+        let (persisted, err, kind, _) = state.persist_state();
+        assert!(!persisted);
+        assert!(err.is_some());
+        assert_eq!(kind.as_deref(), Some(PERSIST_ERROR_IO));
     }
 
     /// A command that was in flight while an emergency press landed must not
@@ -225,5 +630,606 @@ mod tests {
         let state = test_state(dir.join("settings.json"));
         let entered = state.safety_epoch();
         assert_eq!(state.safety_epoch(), entered);
+    }
+
+    #[test]
+    fn successful_persist_clears_error_and_bumps_revision() {
+        let dir = unique_temp_path("rev");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(dir.join("settings.json"));
+        assert!(state.persist().is_ok());
+        assert!(state.persist().is_ok());
+        let (persisted, err, kind, rev) = state.persist_state();
+        assert!(persisted);
+        assert!(err.is_none());
+        assert!(kind.is_none());
+        assert_eq!(rev, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_persist_recovers_after_failure() {
+        // Fail first (unwritable path), then point at a writable dir and
+        // retry: the error clears and the revision advances.
+        let blocker = unique_temp_path("retry-blocker");
+        File::create(&blocker).unwrap();
+        let mut state = test_state(blocker.join("settings.json"));
+        assert!(state.persist().is_err());
+        assert!(!state.persist_state().0);
+
+        let dir = unique_temp_path("retry-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        state.config_path = dir.join("settings.json");
+        assert!(state.retry_persist().is_ok());
+        let (persisted, err, _, rev) = state.persist_state();
+        assert!(persisted);
+        assert!(err.is_none());
+        assert_eq!(rev, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn future_version_config_is_never_overwritten() {
+        let dir = unique_temp_path("future");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // Simulate a file written by a newer KeyGlow.
+        std::fs::write(&path, r#"{"version": 99, "selectedProfile": "default"}"#).unwrap();
+        let loaded = crate::profiles::load(&path);
+        assert!(loaded.future_version);
+
+        let mut state = test_state(path.clone());
+        state.config = Mutex::new(loaded);
+        let err = state.persist().expect_err("must refuse to overwrite newer version");
+        assert!(err.contains("newer KeyGlow version"));
+        let (persisted, _, kind, _) = state.persist_state();
+        assert!(!persisted);
+        assert_eq!(kind.as_deref(), Some(PERSIST_ERROR_NEWER_VERSION));
+        // The file still holds the newer version's data.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"version\": 99") || raw.contains("\"version\":99"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_persist_matches_latest_revision() {
+        // N threads persisting concurrently: the single writer serializes
+        // them, every write is a complete valid file, and the revision
+        // counter matches the number of successful writes.
+        use std::sync::Barrier;
+        let dir = unique_temp_path("conc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(test_state(dir.join("settings.json")));
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..25 {
+                    state.persist().unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let rev = state.persisted_revision.load(Ordering::SeqCst);
+        assert_eq!(rev, 200);
+        let raw = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed.version, crate::profiles::models::CONFIG_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- P3: runtime revision ordering ----
+
+    #[test]
+    fn runtime_revision_starts_at_zero_and_increments() {
+        let dir = unique_temp_path("rt_rev");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(dir.join("settings.json"));
+        assert_eq!(state.runtime_revision.load(Ordering::SeqCst), 0);
+        assert_eq!(state.event_stamp(), (0, 0));
+        state.bump_runtime_revision();
+        state.bump_runtime_revision();
+        assert_eq!(state.runtime_revision.load(Ordering::SeqCst), 2);
+        assert_eq!(state.event_stamp(), (0, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emergency_unlock_bumps_runtime_revision_even_when_persist_fails() {
+        // P3 core distinction: the convergence mutates runtime state
+        // (controller + config), so it must advance the UI ordering
+        // revision even when the best-effort persist fails.
+        // persisted_revision counts disk writes; runtime_revision counts
+        // state mutations. They are different numbers on purpose.
+        //
+        // save() creates missing parent dirs, so a missing dir is NOT a
+        // failure. Use a blocker *file* as the parent: create_dir_all on
+        // a file path fails on every platform.
+        let blocker = unique_temp_path("rt_emg_blocker");
+        File::create(&blocker).unwrap();
+        let state = test_state(blocker.join("settings.json"));
+        // Sanity: this persist really does fail in this fixture.
+        assert!(state.persist().is_err());
+        assert_eq!(state.persisted_revision.load(Ordering::SeqCst), 0);
+
+        state.emergency_unlock();
+
+        assert_eq!(
+            state.runtime_revision.load(Ordering::SeqCst),
+            1,
+            "convergence changed runtime state, so the UI ordering revision must advance"
+        );
+        assert_eq!(
+            state.persisted_revision.load(Ordering::SeqCst),
+            0,
+            "failed persist must not advance the disk revision"
+        );
+        // Physical recovery happened regardless of the disk failure.
+        assert!(state.snapshot_disabled().is_empty());
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn event_stamp_tracks_safety_epoch_and_runtime_revision() {
+        let dir = unique_temp_path("rt_stamp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(dir.join("settings.json"));
+        state.bump_runtime_revision();
+        let epoch = state.safety.trigger();
+        // A trigger alone does not mutate runtime state: the stamp's
+        // revision part only moves on bump_runtime_revision().
+        assert_eq!(state.event_stamp(), (epoch, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- S5: app profiles ----
+
+    fn gaming_rule() -> AppRule {
+        AppRule {
+            id: "r-game".into(),
+            executable_path: "C:\\Games\\game.exe".into(),
+            profile_id: "gaming".into(),
+            enabled: true,
+            priority: 0,
+        }
+    }
+
+    fn add_gaming_rule(state: &AppState) {
+        state.config.lock().app_rules.push(gaming_rule());
+    }
+
+    #[test]
+    fn foreground_switch_applies_rule_without_writing_settings() {
+        let dir = unique_temp_path("s5_nodisk");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let state = test_state(path.clone());
+        state.persist().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        add_gaming_rule(&state);
+
+        // Debouncing: the first sighting starts the timer, no switch yet.
+        assert!(state
+            .note_foreground(Some("C:\\Games\\game.exe".into()), 0)
+            .is_none());
+        let change = state
+            .note_foreground(Some("C:\\Games\\game.exe".into()), 250)
+            .expect("settled switch must commit");
+        assert_eq!(change.profile_id, "gaming");
+        assert_eq!(change.reason, MatchReason::AppRule);
+        // The controller filters Gaming's keys (MetaLeft/Right disabled).
+        assert!(!state.controller.is_enabled(KeyCode::MetaLeft));
+        assert!(!state.controller.is_enabled(KeyCode::MetaRight));
+        // But the file is byte-identical: the switch never touched disk,
+        // and the persisted selection is untouched too.
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(state.config.lock().selected_profile, DEFAULT_PROFILE_ID);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreground_switch_keeps_cat_lock() {
+        let dir = unique_temp_path("s5_catlock");
+        let state = test_state(dir.join("settings.json"));
+        add_gaming_rule(&state);
+        state.controller.set_cat_lock(true);
+
+        state.note_foreground(Some("C:\\Games\\game.exe".into()), 0);
+        let change = state.note_foreground(Some("C:\\Games\\game.exe".into()), 250);
+        assert!(change.is_some());
+        // The lock survives the switch: every key stays blocked.
+        assert!(state.controller.is_cat_locked());
+        assert!(!state.controller.is_enabled(KeyCode::KeyA));
+        assert!(!state.controller.is_enabled(KeyCode::MetaLeft));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emergency_pauses_automation_and_resume_restores_rule() {
+        let dir = unique_temp_path("s5_pause");
+        let state = test_state(dir.join("settings.json"));
+        add_gaming_rule(&state);
+        state.note_foreground(Some("C:\\Games\\game.exe".into()), 0);
+        assert!(state
+            .note_foreground(Some("C:\\Games\\game.exe".into()), 250)
+            .is_some());
+        assert_eq!(state.effective_profile_id(), "gaming");
+
+        state.emergency_unlock();
+        let (eff, _, reason, paused, _, _) = state.app_profile_status();
+        assert_eq!(eff, "default");
+        assert_eq!(reason, MatchReason::SafetyPaused);
+        assert!(paused);
+        assert!(state.controller.is_enabled(KeyCode::MetaLeft));
+
+        // Foreground switches while paused change nothing.
+        state.note_foreground(Some("C:\\Windows\\notepad.exe".into()), 500);
+        assert!(state
+            .note_foreground(Some("C:\\Windows\\notepad.exe".into()), 800)
+            .is_none());
+        assert_eq!(state.effective_profile_id(), "default");
+
+        // Explicit resume re-evaluates the current foreground (Notepad has
+        // no rule): Default with the Default reason.
+        let change = state.resume_auto().expect("resume must report the change");
+        assert_eq!(change.profile_id, "default");
+        assert_eq!(change.reason, MatchReason::Default);
+        assert!(!state.app_profile_status().3);
+    }
+
+    #[test]
+    fn manual_selection_survives_foreground_switch_via_state() {
+        let dir = unique_temp_path("s5_manual");
+        let state = test_state(dir.join("settings.json"));
+        add_gaming_rule(&state);
+        state.set_manual_override("coding");
+        assert_eq!(state.effective_profile_id(), "coding");
+
+        state.note_foreground(Some("C:\\Games\\game.exe".into()), 0);
+        assert!(state
+            .note_foreground(Some("C:\\Games\\game.exe".into()), 250)
+            .is_none());
+        assert_eq!(state.effective_profile_id(), "coding");
+        let (_, manual, reason, _, _, _) = state.app_profile_status();
+        assert_eq!(manual.as_deref(), Some("coding"));
+        assert_eq!(reason, MatchReason::Manual);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_delete_sync_falls_back_effective() {
+        let dir = unique_temp_path("s5_delete");
+        let state = test_state(dir.join("settings.json"));
+        add_gaming_rule(&state);
+        state.note_foreground(Some("C:\\Games\\game.exe".into()), 0);
+        assert!(state
+            .note_foreground(Some("C:\\Games\\game.exe".into()), 250)
+            .is_some());
+        assert_eq!(state.effective_profile_id(), "gaming");
+
+        // Simulate delete_profile's config cleanup: profile + its rules go.
+        {
+            let mut cfg = state.config.lock();
+            cfg.profiles.retain(|p| p.id != "gaming");
+            cfg.app_rules.retain(|r| r.profile_id != "gaming");
+        }
+        let change = state
+            .sync_runtime_after_profile_delete("gaming")
+            .expect("effective profile deleted must fall back");
+        assert_eq!(change.profile_id, "default");
+        assert_eq!(change.reason, MatchReason::Default);
+        assert_eq!(state.effective_profile_id(), "default");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- S8: remap rule wiring ----
+
+    use crate::keyboard::engine::{HookDecision, InjectAction, KeyPhase};
+    use crate::profiles::RemapRule;
+
+    fn set_profile_rules(state: &AppState, profile_id: &str, rules: Vec<RemapRule>) {
+        state
+            .config
+            .lock()
+            .profile_mut(profile_id)
+            .unwrap()
+            .remappings = rules;
+    }
+
+    #[test]
+    fn profile_switch_installs_rules_and_flushes_held() {
+        let dir = unique_temp_path("s8_switch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (state, controller) = test_state_with_controller(dir.join("settings.json"));
+        set_profile_rules(
+            &state,
+            "gaming",
+            vec![RemapRule {
+                from: "KeyA".into(),
+                to: "KeyB".into(),
+            }],
+        );
+        {
+            let mut cfg = state.config.lock();
+            cfg.activate_profile("gaming").unwrap();
+        }
+        state.apply_current_profile();
+        assert_eq!(
+            controller.engine.lock().remap_rules(),
+            vec![(KeyCode::KeyA, KeyCode::KeyB)]
+        );
+        // Hold A: the target is injected.
+        let result = controller
+            .engine
+            .lock()
+            .process(KeyCode::KeyA, KeyPhase::Down, 0);
+        assert_eq!(result.inject, vec![InjectAction::Down(KeyCode::KeyB)]);
+        // Switch to Default (no rules) mid-hold: the held target is
+        // flushed (execute_injections is a stub off Windows, but the
+        // engine state is released) and the new rules install.
+        {
+            let mut cfg = state.config.lock();
+            cfg.activate_profile(DEFAULT_PROFILE_ID).unwrap();
+        }
+        state.apply_current_profile();
+        assert!(controller.engine.lock().remap_rules().is_empty());
+        assert!(controller.engine.lock().flush_remaps().is_empty());
+        // The held A's release injects nothing (already flushed).
+        let release = controller
+            .engine
+            .lock()
+            .process(KeyCode::KeyA, KeyPhase::Up, 0);
+        assert!(release.inject.is_empty());
+        // The next A press forwards normally.
+        let again = controller
+            .engine
+            .lock()
+            .process(KeyCode::KeyA, KeyPhase::Down, 0);
+        assert_eq!(again.decision, HookDecision::Forward);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emergency_falls_back_to_default_rules() {
+        let dir = unique_temp_path("s8_emergency");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (state, controller) = test_state_with_controller(dir.join("settings.json"));
+        set_profile_rules(
+            &state,
+            "gaming",
+            vec![RemapRule {
+                from: "KeyA".into(),
+                to: "KeyB".into(),
+            }],
+        );
+        set_profile_rules(
+            &state,
+            DEFAULT_PROFILE_ID,
+            vec![RemapRule {
+                from: "KeyC".into(),
+                to: "KeyD".into(),
+            }],
+        );
+        {
+            let mut cfg = state.config.lock();
+            cfg.activate_profile("gaming").unwrap();
+        }
+        state.apply_current_profile();
+        assert_eq!(
+            controller.engine.lock().remap_rules(),
+            vec![(KeyCode::KeyA, KeyCode::KeyB)]
+        );
+        // Hold A under Gaming's rule.
+        let held = controller
+            .engine
+            .lock()
+            .process(KeyCode::KeyA, KeyPhase::Down, 0);
+        assert_eq!(held.inject, vec![InjectAction::Down(KeyCode::KeyB)]);
+        // Emergency: held target flushed, Default's rules installed.
+        state.emergency_unlock();
+        assert_eq!(state.config.lock().selected_profile, DEFAULT_PROFILE_ID);
+        assert_eq!(
+            controller.engine.lock().remap_rules(),
+            vec![(KeyCode::KeyC, KeyCode::KeyD)]
+        );
+        assert!(controller.engine.lock().flush_remaps().is_empty());
+        // A's release injects nothing (already flushed); C remaps now.
+        let release = controller
+            .engine
+            .lock()
+            .process(KeyCode::KeyA, KeyPhase::Up, 0);
+        assert!(release.inject.is_empty());
+        let remapped = controller
+            .engine
+            .lock()
+            .process(KeyCode::KeyC, KeyPhase::Down, 0);
+        assert_eq!(remapped.inject, vec![InjectAction::Down(KeyCode::KeyD)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- S9: profile switches install macros/layers ----------------------
+
+    fn set_profile_macros(state: &AppState, profile_id: &str, macros: Vec<MacroDef>) {
+        state
+            .config
+            .lock()
+            .profile_mut(profile_id)
+            .unwrap()
+            .macros = macros;
+    }
+
+    fn set_profile_layers(state: &AppState, profile_id: &str, layers: Vec<LayerDef>) {
+        state
+            .config
+            .lock()
+            .profile_mut(profile_id)
+            .unwrap()
+            .layers = layers;
+    }
+
+    fn test_macro() -> MacroDef {
+        // The second step is delayed, so the run is still in progress
+        // right after the trigger — the switch/emergency tests can
+        // observe the cancellation.
+        MacroDef {
+            id: "m1".into(),
+            name: "Copy".into(),
+            trigger: "F9".into(),
+            cancel_key: "Escape".into(),
+            steps: vec![
+                crate::profiles::MacroStepDef {
+                    key: "ControlLeft".into(),
+                    action: "down".into(),
+                    delay_ms: 0,
+                },
+                crate::profiles::MacroStepDef {
+                    key: "KeyC".into(),
+                    action: "down".into(),
+                    delay_ms: 1000,
+                },
+                crate::profiles::MacroStepDef {
+                    key: "KeyC".into(),
+                    action: "up".into(),
+                    delay_ms: 0,
+                },
+                crate::profiles::MacroStepDef {
+                    key: "ControlLeft".into(),
+                    action: "up".into(),
+                    delay_ms: 0,
+                },
+            ],
+        }
+    }
+
+    fn test_layer() -> LayerDef {
+        LayerDef {
+            id: "l1".into(),
+            name: "Fn".into(),
+            switch_key: "CapsLock".into(),
+            mode: crate::profiles::LayerMode::Hold,
+            disabled_keys: vec![],
+            remappings: vec![],
+        }
+    }
+
+    #[test]
+    fn profile_switch_installs_macros_and_layers() {
+        let dir = unique_temp_path("s9_switch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (state, controller) = test_state_with_controller(dir.join("settings.json"));
+        set_profile_macros(&state, "gaming", vec![test_macro()]);
+        set_profile_layers(&state, "gaming", vec![test_layer()]);
+        {
+            let mut cfg = state.config.lock();
+            cfg.activate_profile("gaming").unwrap();
+        }
+        state.apply_current_profile();
+        // The gaming macro starts on F9 and is still running (its
+        // second step is delayed).
+        let started = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Down, 0);
+        assert_eq!(started.decision, HookDecision::Consume);
+        assert_eq!(
+            started.inject,
+            vec![InjectAction::Down(KeyCode::ControlLeft)]
+        );
+        assert!(controller.engine.lock().macro_running());
+        let _ = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Up, 0);
+        // The gaming layer switches on CapsLock.
+        let switched = controller
+            .engine
+            .lock()
+            .process(KeyCode::CapsLock, KeyPhase::Down, 0);
+        assert_eq!(switched.decision, HookDecision::Consume);
+        assert_eq!(
+            controller.engine.lock().active_layer_id(),
+            Some("l1".into())
+        );
+        // Switch to Default (no macros/layers): the run is cancelled and
+        // the layer deactivated, and the keys go back to normal.
+        {
+            let mut cfg = state.config.lock();
+            cfg.activate_profile(DEFAULT_PROFILE_ID).unwrap();
+        }
+        state.apply_current_profile();
+        assert!(!controller.engine.lock().macro_running());
+        assert_eq!(controller.engine.lock().active_layer_id(), None);
+        let f9 = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Down, 0);
+        assert_eq!(f9.decision, HookDecision::Forward);
+        let _ = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Up, 0);
+        // The switch key was still held across the profile switch; its
+        // release is consumed (its down was consumed too).
+        let caps_up = controller
+            .engine
+            .lock()
+            .process(KeyCode::CapsLock, KeyPhase::Up, 0);
+        assert_eq!(caps_up.decision, HookDecision::Consume);
+        let caps = controller
+            .engine
+            .lock()
+            .process(KeyCode::CapsLock, KeyPhase::Down, 0);
+        assert_eq!(caps.decision, HookDecision::Forward);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emergency_falls_back_to_default_macros_and_layers() {
+        let dir = unique_temp_path("s9_emergency");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (state, controller) = test_state_with_controller(dir.join("settings.json"));
+        set_profile_macros(&state, "gaming", vec![test_macro()]);
+        set_profile_layers(&state, "gaming", vec![test_layer()]);
+        {
+            let mut cfg = state.config.lock();
+            cfg.activate_profile("gaming").unwrap();
+        }
+        state.apply_current_profile();
+        // Start the gaming macro and activate the gaming layer.
+        let _ = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Down, 0);
+        let _ = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Up, 0);
+        let _ = controller
+            .engine
+            .lock()
+            .process(KeyCode::CapsLock, KeyPhase::Down, 0);
+        assert!(controller.engine.lock().macro_running());
+        assert_eq!(
+            controller.engine.lock().active_layer_id(),
+            Some("l1".into())
+        );
+        // Emergency: the macro is cancelled, the layer deactivated, and
+        // Default's (empty) definitions install — the gaming macro no
+        // longer starts.
+        state.emergency_unlock();
+        assert!(!controller.engine.lock().macro_running());
+        assert_eq!(controller.engine.lock().active_layer_id(), None);
+        let f9 = controller
+            .engine
+            .lock()
+            .process(KeyCode::F9, KeyPhase::Down, 0);
+        assert_eq!(f9.decision, HookDecision::Forward);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4,12 +4,13 @@ import { useT } from "../../hooks/useT";
 interface KeyboardKeyProps {
   keyDef: KeyDef;
   state: VisualKeyState;
+  stale?: boolean;
   unit: number;
   gap: number;
   onToggle: (code: string) => void;
 }
 
-export function KeyboardKey({ keyDef, state, unit, gap, onToggle }: KeyboardKeyProps) {
+export function KeyboardKey({ keyDef, state, stale, unit, gap, onToggle }: KeyboardKeyProps) {
   const t = useT();
   const width = Math.max(28, keyDef.w * unit - gap);
   const height = Math.max(28, keyDef.h * unit - gap);
@@ -21,10 +22,17 @@ export function KeyboardKey({ keyDef, state, unit, gap, onToggle }: KeyboardKeyP
   const className = [
     "keycap",
     unsupported ? "unsupported" : state,
+    stale && !unsupported ? "stale" : "",
   ].join(" ");
 
   const stateLabel =
-    state === "disabled" ? t("keyDisabled") : state === "pressed" ? t("keyPressed") : t("keyEnabled");
+    state === "disabled"
+      ? t("keyDisabled")
+      : state === "pressed"
+        ? stale
+          ? `${t("keyPressed")} (${t("keyStale")})`
+          : t("keyPressed")
+        : t("keyEnabled");
   const title = unsupported
     ? t("fnUnsupported", { label: keyDef.label || keyDef.code })
     : t("keyTooltip", {

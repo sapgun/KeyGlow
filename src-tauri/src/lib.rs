@@ -8,10 +8,12 @@ mod tray;
 
 use commands::*;
 use keyboard::hook::HookEvent;
+use keyboard::hook_lifecycle::HookExit;
 use keyboard::SafetyState;
+use platform::foreground::spawn_foreground_observer;
 use platform::start_input_backend;
 use state::AppState;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -24,9 +26,18 @@ pub fn show_main(app: &tauri::AppHandle) {
     }
 }
 
-fn emit_key(app: &tauri::AppHandle, event: &str, code: &str) {
+fn emit_key(app: &tauri::AppHandle, event: &str, code: &str, seq: u64) {
     static WARNED: AtomicBool = AtomicBool::new(false);
-    if let Err(err) = app.emit(event, code) {
+    // P3: the native event sequence travels with the key event so the UI
+    // can order key events against pressed-snapshot responses. Without it,
+    // a snapshot taken before a key-down but applied after would drop the
+    // physically held key from the display.
+    #[derive(serde::Serialize, Clone, Debug)]
+    struct KeyPressPayload<'a> {
+        code: &'a str,
+        seq: u64,
+    }
+    if let Err(err) = app.emit(event, KeyPressPayload { code, seq }) {
         if !WARNED.swap(true, Ordering::Relaxed) {
             tracing::error!("failed to emit {event} to UI: {err}");
         }
@@ -35,16 +46,27 @@ fn emit_key(app: &tauri::AppHandle, event: &str, code: &str) {
 
 fn dispatch_hook_event(app: &tauri::AppHandle, event: HookEvent) {
     match event {
-        HookEvent::KeyDown { code } => emit_key(app, "keyboard:key-down", code.as_str()),
-        HookEvent::KeyUp { code } => emit_key(app, "keyboard:key-up", code.as_str()),
+        HookEvent::KeyDown { code, seq } => emit_key(app, "keyboard:key-down", code.as_str(), seq),
+        HookEvent::KeyUp { code, seq } => emit_key(app, "keyboard:key-up", code.as_str(), seq),
         HookEvent::EmergencyUnlock { epoch } => {
             if let Some(state) = app.try_state::<AppState>() {
-                // Fallback path: normally the safety worker already claimed
-                // this epoch. If the worker is gone, a surviving queue event
-                // still converges the state exactly once.
-                if state.safety.claim_reconcile(epoch) {
-                    state.emergency_unlock();
-                    emit_safety_converged(app);
+                // Fallback path: converges only if the safety worker hasn't,
+                // and never blocks the UI thread. If the worker is already
+                // converging, it will pick up the latest epoch itself via
+                // pending_epoch(), so skipping here loses nothing.
+                if state.safety.reconciled_epoch() < epoch {
+                    if let Some(_work) = state.safety.try_convergence_lock() {
+                        // Re-check under the lock: the worker may have
+                        // finished while we were deciding.
+                        let target = state.safety.epoch();
+                        if state.safety.reconciled_epoch() < target {
+                            let _elected = state.safety.claim_reconcile(target);
+                            state.emergency_unlock();
+                            state.safety.complete_reconcile(target);
+                            drop(_work);
+                            emit_safety_converged(app);
+                        }
+                    }
                 }
             }
         }
@@ -54,10 +76,36 @@ fn dispatch_hook_event(app: &tauri::AppHandle, event: HookEvent) {
 /// Converge UI + tray to the post-emergency safe state. Idempotent: safe to
 /// call from the worker, the event pump, or a stale-command path.
 pub(crate) fn emit_safety_converged(app: &tauri::AppHandle) {
+    use crate::commands::keyboard::{CatLockPayload, EmergencyPayload, StateChangedPayload};
     if let Some(state) = app.try_state::<AppState>() {
-        let _ = app.emit("keyboard:emergency-unlock", ());
-        let _ = app.emit("keyboard:state-changed", state.snapshot_disabled());
-        let _ = app.emit("keyboard:cat-lock", false);
+        // P3: every payload carries the ordering stamp. The emergency event
+        // fires only after complete_reconcile, so its (epoch, revision) is
+        // authoritative truth the UI can floor on: anything older is stale.
+        let epoch = state.safety.epoch();
+        let runtime_revision = state.runtime_revision.load(Ordering::SeqCst);
+        let _ = app.emit(
+            "keyboard:emergency-unlock",
+            EmergencyPayload {
+                epoch,
+                runtime_revision,
+            },
+        );
+        let _ = app.emit(
+            "keyboard:state-changed",
+            StateChangedPayload {
+                keys: state.snapshot_disabled(),
+                safety_epoch: epoch,
+                runtime_revision,
+            },
+        );
+        let _ = app.emit(
+            "keyboard:cat-lock",
+            CatLockPayload {
+                locked: false,
+                safety_epoch: epoch,
+                runtime_revision,
+            },
+        );
         let _ = app.emit("profile:changed", state.config.lock().clone());
         tray::refresh(app);
         tracing::warn!("emergency unlock converged (Default profile, all keys enabled)");
@@ -68,13 +116,22 @@ pub(crate) fn emit_safety_converged(app: &tauri::AppHandle) {
 /// landed: its intent must not re-disable keys after the unlock.
 ///
 /// Convergence here is forced, not claim-based: the stale command's own
-/// mutations may have landed *after* the worker's exactly-once convergence,
-/// so the claim cannot be relied on to repair them. `emergency_unlock` is
-/// idempotent (controller enable-all, Default selection, cleared disable
-/// set, best-effort persist), and this path only runs on a genuine race,
-/// never once per press.
+/// mutations may have landed *after* the worker's convergence, so election
+/// alone cannot be relied on to repair them. The work is serialized with the
+/// worker/pump paths via the convergence lock (blocking is fine: command
+/// handlers run on a thread pool, never on the hook callback or UI thread),
+/// and the completion marker is advanced only after the work finished.
+/// `emergency_unlock` is idempotent (controller enable-all, Default
+/// selection, cleared disable set, best-effort persist), and this path only
+/// runs on a genuine race, never once per press.
 pub(crate) fn discard_stale_command(app: &tauri::AppHandle, state: &AppState, reason: &'static str) {
-    state.emergency_unlock();
+    {
+        let _work = state.safety.convergence_lock();
+        let target = state.safety.epoch();
+        let _elected = state.safety.claim_reconcile(target);
+        state.emergency_unlock();
+        state.safety.complete_reconcile(target);
+    }
     emit_safety_converged(app);
     tracing::warn!("command discarded after emergency unlock ({reason})");
 }
@@ -99,13 +156,22 @@ fn spawn_event_pump(app: tauri::AppHandle, rx: std::sync::mpsc::Receiver<HookEve
         .expect("failed to start event pump thread");
 }
 
-/// Safety worker for emergency unlock (HF-01).
+/// Safety worker for emergency unlock (HF-01, P2).
 ///
 /// The hook thread only bumps the safety epoch and wakes this worker over an
 /// unbounded channel, so a saturated UI event queue (or a delayed UI thread)
 /// can never lose the unlock: the epoch latch is authoritative and the worker
 /// converges config + controller + persist on its own thread. UI/tray events
 /// still go through the main thread, mirroring the event pump.
+///
+/// Convergence protocol (P2): the worker loops on `pending_epoch()` and, for
+/// each pending epoch, takes the convergence lock (blocking is fine here:
+/// this is a dedicated background thread, never the hook callback or the UI
+/// thread), re-checks under the lock, runs the idempotent
+/// `emergency_unlock()`, and only then advances the completion marker. A
+/// newer trigger landing mid-work is picked up by the next loop iteration,
+/// and convergence work never overlaps with the pump fallback or the
+/// stale-command path.
 fn spawn_safety_worker(
     app: tauri::AppHandle,
     safety: Arc<SafetyState>,
@@ -117,25 +183,106 @@ fn spawn_safety_worker(
             while wake.recv().is_ok() {
                 // Coalesce rapid repeated presses; the epoch decides the work.
                 while wake.try_recv().is_ok() {}
-                let epoch = safety.epoch();
                 let Some(state) = app.try_state::<AppState>() else {
                     continue;
                 };
-                if !safety.claim_reconcile(epoch) {
-                    continue;
+                let mut did_work = false;
+                loop {
+                    if safety.pending_epoch().is_none() {
+                        break;
+                    }
+                    {
+                        let _work = safety.convergence_lock();
+                        // Re-check under the lock: another path may have
+                        // converged while we were waiting for it.
+                        if safety.reconciled_epoch() >= safety.epoch() {
+                            break;
+                        }
+                        let target = safety.epoch();
+                        let _elected = safety.claim_reconcile(target);
+                        state.emergency_unlock();
+                        safety.complete_reconcile(target);
+                        did_work = true;
+                    }
+                    // Loop again: a newer epoch may have landed during the work.
                 }
-                state.emergency_unlock();
-                let handle = app.clone();
-                let posted = handle.clone();
-                if handle
-                    .run_on_main_thread(move || emit_safety_converged(&posted))
-                    .is_err()
-                {
-                    emit_safety_converged(&app);
+                if did_work {
+                    let handle = app.clone();
+                    let posted = handle.clone();
+                    if handle
+                        .run_on_main_thread(move || emit_safety_converged(&posted))
+                        .is_err()
+                    {
+                        emit_safety_converged(&app);
+                    }
                 }
             }
         })
         .expect("failed to start safety worker thread");
+}
+
+/// Watch the hook thread's terminal report (HF-07).
+///
+/// The hook thread reports exactly once on exit. A requested shutdown is
+/// silent; an unexpected death flips `hook_active`/`hook_error` — no more
+/// stale "keyboard control active" — and emits `hook:status-changed` so the
+/// UI updates without waiting for the next snapshot poll. The update runs
+/// on this dedicated watcher thread, never on the hook callback.
+fn spawn_hook_watcher(app: tauri::AppHandle, exit_rx: Receiver<HookExit>) {
+    std::thread::Builder::new()
+        .name("keyglow-hook-watch".into())
+        .spawn(move || {
+            while let Ok(exit) = exit_rx.recv() {
+                // Records the exit in the lifecycle machine; true only when
+                // this newly surfaced a failure (announce-once).
+                if !keyboard::hook::lifecycle_note_thread_exit(&exit) {
+                    continue;
+                }
+                let reason = exit.error.unwrap_or_else(|| {
+                    "keyboard hook stopped unexpectedly; restart the app to restore keyboard control"
+                        .to_string()
+                });
+                tracing::error!("keyboard hook thread died: {reason}");
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.hook_active.store(false, Ordering::SeqCst);
+                    *state.hook_error.lock() = Some(reason.clone());
+                }
+                let _ = app.emit(
+                    "hook:status-changed",
+                    commands::keyboard::HookStatusPayload {
+                        hook_active: false,
+                        hook_error: Some(reason),
+                    },
+                );
+            }
+        })
+        .expect("failed to start hook watcher thread");
+}
+
+/// S9: the macro tick thread. Polls the controller every 25ms when idle,
+/// and wakes at the next due step (at most 25ms out) while a run is in
+/// progress — so the first step of a run starts at most 25ms after its
+/// trigger press. The tick and its `SendInput` run atomically inside the
+/// controller (same lock discipline as the hook callback), so a cancel
+/// key cannot interleave a down after the run's up. A daemon thread: it
+/// ends with the process.
+fn spawn_macro_tick_thread(controller: Arc<dyn keyboard::engine::KeyboardController>) {
+    std::thread::Builder::new()
+        .name("keyglow-macro".into())
+        .spawn(move || loop {
+            let now_ms = keyboard::engine::macro_now_ms();
+            let (running, next_due) = controller.macro_tick_execute(now_ms);
+            let sleep_ms = if running {
+                next_due
+                    .map(|due| due.saturating_sub(now_ms).max(1))
+                    .unwrap_or(25)
+                    .min(25)
+            } else {
+                25
+            };
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+        })
+        .expect("failed to start macro tick thread");
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -161,6 +308,9 @@ pub fn run() {
             enable_all_keys,
             set_cat_lock,
             select_layout,
+            import_layout,
+            delete_custom_layout,
+            list_custom_layouts,
             set_onboarded,
             set_start_with_windows,
             set_locale,
@@ -173,6 +323,26 @@ pub fn run() {
             rename_profile,
             delete_profile,
             reset_profile,
+            get_app_rules,
+            save_app_rule,
+            delete_app_rule,
+            save_remap_rule,
+            delete_remap_rule,
+            save_macro,
+            delete_macro,
+            save_layer,
+            delete_layer,
+            validate_qmk_keymap,
+            import_qmk_keymap,
+            validate_via_keymap,
+            import_via_keymap,
+            export_qmk_keymap,
+            export_via_keymap,
+            set_auto_profile_enabled,
+            resume_auto_profile,
+            get_app_profile_status,
+            retry_persist,
+            get_pressed_snapshot,
         ])
         .setup(|app| {
             let path = match app.path().app_config_dir() {
@@ -191,6 +361,25 @@ pub fn run() {
                 .map(|p| crate::state::parse_key_ids(&p.disabled_keys))
                 .unwrap_or_default();
             backend.controller.set_disabled_keys(&keys);
+            // S8: the current profile's remap rules apply from startup
+            // (the engine is fresh, so the flush is empty).
+            let rules = config
+                .current_profile()
+                .map(|p| crate::state::parse_remap_rules(&p.remappings))
+                .unwrap_or_default();
+            let _ = backend.controller.set_remap_rules(&rules);
+            // S9: the current profile's macros and layers apply from
+            // startup too (no run is in progress, no layer is active).
+            let macros = config
+                .current_profile()
+                .map(|p| p.macros.clone())
+                .unwrap_or_default();
+            let _ = backend.controller.set_macros(&macros);
+            let layers = config
+                .current_profile()
+                .map(|p| p.layers.clone())
+                .unwrap_or_default();
+            let _ = backend.controller.set_layers(&layers);
 
             if backend.hook_active {
                 tracing::info!("keyboard control active");
@@ -202,6 +391,9 @@ pub fn run() {
             }
 
             let start_with_windows = config.start_with_windows;
+            // S9: the macro tick thread needs the controller after it
+            // moves into AppState.
+            let macro_controller = backend.controller.clone();
             app.manage(AppState {
                 controller: backend.controller,
                 config: parking_lot::Mutex::new(config),
@@ -210,6 +402,16 @@ pub fn run() {
                 hook_error: parking_lot::Mutex::new(backend.hook_error),
                 shutdown: backend.shutdown,
                 safety: backend.safety.clone(),
+                persist_lock: parking_lot::Mutex::new(()),
+                persisted_revision: AtomicU64::new(0),
+                persist_error: parking_lot::Mutex::new(None),
+                persist_error_kind: parking_lot::Mutex::new(None),
+                runtime_revision: AtomicU64::new(0),
+                app_profiles: parking_lot::Mutex::new(
+                    crate::profiles::app_profiles::AppProfileRuntime::new(
+                        crate::profiles::DEFAULT_PROFILE_ID,
+                    ),
+                ),
             });
 
             spawn_event_pump(app.handle().clone(), backend.events);
@@ -218,6 +420,14 @@ pub fn run() {
                 backend.safety,
                 backend.safety_wake,
             );
+            // S9: the macro tick thread (daemon; ends with the process).
+            spawn_macro_tick_thread(macro_controller);
+            if let Some(exit_rx) = backend.hook_exit {
+                spawn_hook_watcher(app.handle().clone(), exit_rx);
+            }
+            // S5: the foreground observer runs on its own thread, away
+            // from the hook callback. No-op off Windows.
+            spawn_foreground_observer(app.handle().clone());
             tray::setup(app.handle())?;
 
             if let Some(window) = app.get_webview_window("main") {
@@ -286,6 +496,7 @@ mod layout_tests {
     fn layouts_are_valid() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src/layouts");
         let mut found = 0;
+        let mut ids = HashSet::new();
         for entry in fs::read_dir(&dir).expect("layouts dir") {
             let path = entry.unwrap().path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
@@ -294,6 +505,7 @@ mod layout_tests {
             found += 1;
             let layout: Layout =
                 serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            ids.insert(layout.id.clone());
             let mut codes = HashSet::new();
             for key in &layout.keys {
                 assert!(key.w > 0.0 && key.h > 0.0, "{} has non-positive size", key.code);
@@ -314,6 +526,18 @@ mod layout_tests {
                 }
             }
         }
-        assert_eq!(found, 5, "expected five layout files");
+        assert_eq!(found, 7, "expected seven layout files");
+        // S6: 5 ANSI + ISO + JIS.
+        for id in [
+            "fullsize-ansi",
+            "tkl-ansi",
+            "75-ansi",
+            "65-ansi",
+            "60-ansi",
+            "fullsize-iso",
+            "fullsize-jis",
+        ] {
+            assert!(ids.contains(id), "missing layout {id}");
+        }
     }
 }

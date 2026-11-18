@@ -1,6 +1,12 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Keyboard } from "./components/Keyboard/Keyboard";
+import { AppRulesPanel } from "./components/AppRulesPanel";
+import { RemapPanel } from "./components/RemapPanel";
+import { MacroPanel } from "./components/MacroPanel";
+import { LayerPanel } from "./components/LayerPanel";
+import { QmkImportDialog } from "./components/QmkImportDialog";
 import { LayoutSelector } from "./components/LayoutSelector";
+import { LayoutImportDialog } from "./components/LayoutImportDialog";
 import { Onboarding } from "./components/Onboarding";
 import { ProfileSelector } from "./components/ProfileSelector";
 import { StatusBar } from "./components/StatusBar";
@@ -17,6 +23,8 @@ export default function App() {
   const locale = useLocale();
   const layout = getLayout(store.layoutId);
   const profile = store.profiles.find((item) => item.id === store.profileId);
+  const [importOpen, setImportOpen] = useState(false);
+  const [qmkOpen, setQmkOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -34,33 +42,103 @@ export default function App() {
       if (!event.code) return;
       useAppStore.getState().notePress(event.code, false);
     };
+    // HF-04: key-up events can be missed while the window is hidden or the
+    // machine sleeps. Reconcile with the native pressed snapshot instead
+    // of trusting the (lossy) event stream alone.
+    const resync = () => {
+      void useAppStore.getState().resyncPressed();
+    };
+    const onFocus = () => resync();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") resync();
+    };
     window.addEventListener("keydown", onWindowDown, true);
     window.addEventListener("keyup", onWindowUp, true);
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
 
-    Promise.all([
-      api.onKeyDown((code) => useAppStore.getState().notePress(code, true)),
-      api.onKeyUp((code) => useAppStore.getState().notePress(code, false)),
-      api.onStateChanged((keys) => useAppStore.setState({ disabledKeys: keys })),
-      api.onEmergencyUnlock(() => {
-        useAppStore.getState().showEmergency();
-        void useAppStore.getState().hydrate();
-      }),
-      api.onProfileChanged(() => {
-        void useAppStore.getState().hydrate();
-      }),
-      api.onCatLock((locked) => useAppStore.setState({ catLock: locked })),
-    ]).then((fns) => {
-      if (cancelled) {
-        fns.forEach((fn) => fn());
+    // HF-09/HF-05: subscribe independently. If any listener fails, the ones
+    // that already registered are unlistened again instead of leaking, and
+    // the failure is surfaced (previously Promise.all dropped everything
+    // silently on a single rejection).
+    const subscribe = (async () => {
+      const results = await Promise.allSettled([
+        api.onKeyDown((code, seq) => useAppStore.getState().notePress(code, true, seq)),
+        api.onKeyUp((code, seq) => useAppStore.getState().notePress(code, false, seq)),
+        // P3: state-affecting native events go through the ordering gate —
+        // a late/duplicate event can never overwrite newer state.
+        api.onStateChanged((payload) =>
+          useAppStore
+            .getState()
+            .applyNativeEvent(
+              { disabledKeys: payload.keys },
+              payload.safetyEpoch,
+              payload.runtimeRevision,
+            ),
+        ),
+        api.onEmergencyUnlock((payload) => {
+          useAppStore.getState().showEmergency(payload);
+          void useAppStore.getState().hydrate();
+          void useAppStore.getState().resyncPressed();
+        }),
+        api.onProfileChanged(() => {
+          void useAppStore.getState().hydrate();
+        }),
+        api.onCatLock((payload) =>
+          useAppStore
+            .getState()
+            .applyNativeEvent(
+              { catLock: payload.locked },
+              payload.safetyEpoch,
+              payload.runtimeRevision,
+            ),
+        ),
+        // HF-07: the hook thread died on its own — flip the status bar and
+        // the unavailable banner without waiting for a snapshot poll.
+        api.onHookStatusChanged((payload) =>
+          useAppStore.getState().setHookStatus(payload.hookActive, payload.hookError),
+        ),
+        // S5: the foreground observer switched the effective profile —
+        // apply through the P3 ordering gate so a late switch can never
+        // overwrite newer (manual or post-emergency) state.
+        api.onAutoSwitched((payload) => useAppStore.getState().applyAutoSwitched(payload)),
+      ]);
+      const fns: Array<() => void> = [];
+      let failure: unknown = null;
+      for (const result of results) {
+        if (result.status === "fulfilled") {
+          fns.push(result.value);
+        } else if (failure === null) {
+          failure = result.reason;
+        }
+      }
+      if (cancelled || failure !== null) {
+        for (const fn of fns) {
+          try {
+            fn();
+          } catch {
+            // Best effort: never let cleanup itself throw.
+          }
+        }
+        if (failure !== null && !cancelled) {
+          useAppStore.setState({ eventError: t("eventSubscribeFailed") });
+        }
         return;
       }
       unlisteners.push(...fns);
+    })();
+    void subscribe.catch(() => {
+      // allSettled never rejects; this is unreachable by construction, but
+      // a rejected promise must never escape silently (HF-05).
     });
 
     return () => {
       cancelled = true;
       window.removeEventListener("keydown", onWindowDown, true);
       window.removeEventListener("keyup", onWindowUp, true);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+      useAppStore.getState().clearPressTracking();
       unlisteners.forEach((fn) => fn());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -95,6 +173,12 @@ export default function App() {
           </div>
           <div className="flex flex-wrap items-end gap-6">
             <LayoutSelector value={store.layoutId} onChange={store.chooseLayout} />
+            <button
+              className="mb-0.5 h-9 rounded-lg border border-border bg-panel-2 px-3 text-sm hover:border-lime/40"
+              onClick={() => setImportOpen(true)}
+            >
+              {t("importLayout")}
+            </button>
             <ProfileSelector
               profiles={store.profiles}
               value={store.profileId}
@@ -130,6 +214,36 @@ export default function App() {
           </div>
         )}
 
+        {(store.error || store.eventError || (!store.persisted && store.persistError)) && (
+          <div className="mb-4 flex items-center justify-between gap-4 rounded-xl border border-danger/30 bg-danger/10 px-4 py-3 text-sm text-danger">
+            <span>
+              {store.eventError
+                ? store.eventError
+                : store.persistErrorKind === "newer_version"
+                  ? t("newerVersionSettings")
+                  : store.error
+                    ? `${t("settingsSaveFailed")} ${store.error}`
+                    : `${t("settingsUnsaved")} ${store.persistError ?? ""}`}
+            </span>
+            {!store.eventError && (
+              <span className="flex flex-shrink-0 gap-2">
+                <button
+                  className="h-8 rounded-lg border border-danger/40 px-3 text-xs hover:bg-danger/10"
+                  onClick={() => void store.retryPersist()}
+                >
+                  {t("retry")}
+                </button>
+                <button
+                  className="h-8 rounded-lg border border-danger/40 px-3 text-xs hover:bg-danger/10"
+                  onClick={() => void store.enableAll()}
+                >
+                  {t("enableAll")}
+                </button>
+              </span>
+            )}
+          </div>
+        )}
+
         <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-panel p-4">
           <div className="mb-2 flex flex-shrink-0 items-center justify-between gap-3 text-[11px] uppercase tracking-[0.14em] text-muted">
             <span>
@@ -143,11 +257,48 @@ export default function App() {
               layout={layout}
               disabledKeys={store.disabledKeys}
               pressedKeys={store.pressedKeys}
+              staleKeys={store.staleKeys}
               catLock={store.catLock}
               onToggle={store.toggleKey}
             />
           </div>
         </section>
+
+        <AppRulesPanel
+          rules={store.appRules}
+          profiles={store.profiles}
+          autoEnabled={store.autoProfileEnabled}
+          paused={store.autoProfilePaused}
+          matchReason={store.matchReason}
+          activeExe={store.activeExe}
+          activeProfileId={store.profileId}
+          onSave={store.saveAppRule}
+          onDelete={store.removeAppRule}
+          onToggleAuto={store.setAutoProfileEnabled}
+          onResume={store.resumeAuto}
+        />
+
+        <RemapPanel
+          rules={profile?.remappings ?? []}
+          layout={layout}
+          onSave={store.saveRemapRule}
+          onDelete={store.removeRemapRule}
+        />
+
+        <MacroPanel
+          macros={profile?.macros ?? []}
+          layout={layout}
+          onSave={store.saveMacro}
+          onDelete={store.removeMacro}
+        />
+
+        <LayerPanel
+          layers={profile?.layers ?? []}
+          activeLayerId={store.activeLayerId}
+          layout={layout}
+          onSave={store.saveLayer}
+          onDelete={store.removeLayer}
+        />
 
         <div className="mt-3 flex flex-shrink-0 flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-5 text-xs text-muted">
@@ -157,6 +308,12 @@ export default function App() {
           </div>
           <div className="flex items-center gap-2">
             <CatLockButton locked={store.catLock} onToggle={() => void store.toggleCatLock()} />
+            <button
+              className="h-9 rounded-lg border border-border bg-panel-2 px-4 text-sm hover:border-lime/30"
+              onClick={() => setQmkOpen(true)}
+            >
+              {t("qmkOpen")}
+            </button>
             <label className="mr-3 flex items-center gap-2 text-xs text-muted">
               <input
                 type="checkbox"
@@ -187,6 +344,8 @@ export default function App() {
         profileName={profile ? profileLabel(profile, locale) : t("profile.default")}
         disabledCount={store.disabledKeys.length}
       />
+      {importOpen && <LayoutImportDialog onClose={() => setImportOpen(false)} />}
+      {qmkOpen && <QmkImportDialog layout={layout} onClose={() => setQmkOpen(false)} />}
     </div>
   );
 }

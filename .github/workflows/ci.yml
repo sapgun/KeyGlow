@@ -1,0 +1,153 @@
+# KeyGlow CI
+#
+# Runs on Windows because this is a Windows-only Tauri app
+# (WH_KEYBOARD_LL hook, windows-sys, NSIS installer).
+# windows-latest runners already include the MSVC C++ toolchain and the
+# WebView2 runtime, so no extra setup is needed for those.
+#
+# What each job proves:
+#   version-check : package.json / src-tauri/Cargo.toml /
+#                   src-tauri/tauri.conf.json all carry the same version.
+#   build         : npm ci -> npm test (layout validator) ->
+#                   npm run test:rust -> npm run build. Each step is separate
+#                   so a failure fails the workflow loudly; a failed step can
+#                   never be mistaken for a green build.
+#   installer     : full `tauri build` producing the NSIS installer and the
+#                   portable exe. SHA256 sums are computed and uploaded with
+#                   the artifacts.
+#   release-gate  : runs only when everything above is green. Verifies what
+#                   is mechanically verifiable and prints the manual gates
+#                   that must be satisfied before any public release.
+
+name: CI
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+
+env:
+  NODE_VERSION: "22"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version-check:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: package.json / Cargo.toml / tauri.conf.json versions must match
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
+            const cargo = fs.readFileSync('src-tauri/Cargo.toml', 'utf8').match(/^version = \"(.+)\"/m)[1];
+            const tauri = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8')).version;
+            console.log('package.json:      ' + pkg);
+            console.log('src-tauri/Cargo.toml: ' + cargo);
+            console.log('tauri.conf.json:   ' + tauri);
+            if (pkg !== cargo || pkg !== tauri) {
+              console.error('VERSION MISMATCH - refusing to continue');
+              process.exit(1);
+            }
+            console.log('versions consistent: ' + pkg);
+          "
+
+  build:
+    name: Build and test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Setup Rust stable (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies (lockfile)
+        run: npm ci
+
+      - name: Layout validation
+        run: npm test
+
+      - name: Rust tests
+        run: npm run test:rust
+
+      - name: Frontend build
+        run: npm run build
+
+  installer:
+    name: Build installer (Windows)
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Setup Rust stable (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies (lockfile)
+        run: npm ci
+
+      - name: Build NSIS installer + portable exe
+        # tauri.conf.json beforeBuildCommand already runs `npm run build`.
+        # bundle.targets = ["nsis"]; the portable exe is the raw release
+        # binary (target/release/keyglow.exe), same as the v0.1.0 release.
+        run: npm run tauri build
+
+      - name: Compute SHA256 sums
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -Path "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction Stop)
+          if ($installers.Count -eq 0) { throw "NSIS installer missing" }
+          $portable = Get-Item -LiteralPath "src-tauri/target/release/keyglow.exe" -ErrorAction Stop
+          $items = @($installers) + @($portable)
+          $items | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Out-File -Encoding utf8 SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: keyglow-windows
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/keyglow.exe
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+  release-gate:
+    name: Release gate
+    needs: [version-check, build, installer]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Manual gates before any public release
+        run: |
+          cat <<'EOF'
+          CI is green, but a public release additionally requires ALL of:
+            1. P0 fixes (HF-01/02/03) merged to main and smoke-tested on a
+               real Windows machine (see docs/TEST-CHECKLIST.md).
+            2. Windows device evidence recorded for every HF touched by the
+               release - never claim an untested OS as verified.
+            3. docs/RELEASE-DRAFT.md filled in: source SHA, binary SHA256
+               from the installer job above, upgrade test results.
+            4. Code signing status stated truthfully (currently: unsigned).
+            5. Explicit human approval. This workflow never publishes a
+               release on its own.
+          EOF

@@ -122,6 +122,20 @@ const META = {
   Numpad7: { vk: "VK_NUMPAD7", vkCode: 0x67, label: "7", category: "numpad" },
   Numpad8: { vk: "VK_NUMPAD8", vkCode: 0x68, label: "8", category: "numpad" },
   Numpad9: { vk: "VK_NUMPAD9", vkCode: 0x69, label: "9", category: "numpad" },
+  // S6: ISO/JIS extra keys.
+  // IntlBackslash and IntlRo share VK_OEM_102 (0xE2); the hook tells them
+  // apart by scan code (0x56 vs 0x73). IntlYen shares VK_OEM_5 (0xDC)
+  // with Backslash; scan 0x7D (yen) vs 0x2B (backslash) disambiguates.
+  // IntlYen's VK is provisional: AHK documents vkDCsc07D; confirm on
+  // real JIS hardware. IntlHash is NOT a code: scan 0x2B is one physical
+  // key reported as Backslash on ANSI (# on ISO, ] on JIS); layouts
+  // differ only by label.
+  IntlBackslash: { vk: "VK_OEM_102", vkCode: 0xe2, label: "\\", subLabel: "|", category: "punctuation" },
+  IntlYen: { vk: "VK_OEM_5", vkCode: 0xdc, label: "¥", subLabel: "|", category: "punctuation" },
+  IntlRo: { vk: "VK_OEM_102", vkCode: 0xe2, label: "\\", subLabel: "ろ", category: "punctuation" },
+  Convert: { vk: "VK_CONVERT", vkCode: 0x1c, label: "変換", category: "modifier" },
+  NonConvert: { vk: "VK_NONCONVERT", vkCode: 0x1d, label: "無変換", category: "modifier" },
+  KanaMode: { vk: "VK_KANA", vkCode: 0x15, label: "かな", category: "modifier" },
 };
 
 function key(code, x, y, w = 1, h = 1, extra = {}) {
@@ -226,6 +240,111 @@ function ansiMain(y0, options = {}) {
   return keys;
 }
 
+// S6: ISO 105-key main block. ANSI 104 minus the A-row Backslash plus
+// IntlBackslash and the A-row # key (scan 0x2B, reported as Backslash,
+// label only). The tall L-shaped Enter is approximated by one 1.25u x 2u
+// rectangle at x=13.75, which leaves a 0.25u visual gap on the Q row;
+// the renderer draws it as a plain rectangle. Bottom row is ANSI.
+function isoMain(y0) {
+  const y1 = y0;
+  const y2 = y0 + 1;
+  const y3 = y0 + 2;
+  const y4 = y0 + 3;
+  const y5 = y0 + 4;
+  const keys = [];
+
+  keys.push(key("Backquote", 0, y1));
+  keys.push(...rowKeys(DIGITS, 1, y1));
+  keys.push(key("Minus", 11, y1));
+  keys.push(key("Equal", 12, y1));
+  keys.push(key("Backspace", 13, y1, 2));
+
+  keys.push(key("Tab", 0, y2, 1.5));
+  keys.push(...rowKeys(LETTERS_Q, 1.5, y2));
+  keys.push(key("BracketLeft", 11.5, y2));
+  keys.push(key("BracketRight", 12.5, y2));
+  keys.push(key("Enter", 13.75, y2, 1.25, 2));
+
+  keys.push(key("CapsLock", 0, y3, 1.75));
+  keys.push(...rowKeys(LETTERS_A, 1.75, y3));
+  keys.push(key("Semicolon", 10.75, y3));
+  keys.push(key("Quote", 11.75, y3));
+  keys.push(key("Backslash", 12.75, y3, 1, 1, { label: "#", subLabel: "~" }));
+
+  keys.push(key("ShiftLeft", 0, y4, 1.25));
+  keys.push(key("IntlBackslash", 1.25, y4));
+  keys.push(...rowKeys(LETTERS_Z, 2.25, y4));
+  keys.push(key("Comma", 9.25, y4));
+  keys.push(key("Period", 10.25, y4));
+  keys.push(key("Slash", 11.25, y4));
+  keys.push(key("ShiftRight", 12.25, y4, 2.75));
+
+  keys.push(key("ControlLeft", 0, y5, 1.25));
+  keys.push(key("MetaLeft", 1.25, y5, 1.25));
+  keys.push(key("AltLeft", 2.5, y5, 1.25));
+  keys.push(key("Space", 3.75, y5, 6.25));
+  keys.push(key("AltRight", 10, y5, 1.25));
+  keys.push(key("MetaRight", 11.25, y5, 1.25));
+  keys.push(key("ContextMenu", 12.5, y5, 1.25));
+  keys.push(key("ControlRight", 13.75, y5, 1.25));
+  return keys;
+}
+
+// S6: JIS 109-key main block. ANSI 104 plus five extra scan codes
+// (KanaMode 0x70, IntlRo 0x73, Convert 0x79, NonConvert 0x7B,
+// IntlYen 0x7D). Several keys reuse ANSI codes by position with
+// JIS legends: Backquote = 半角/全角, Equal = ^, BracketLeft = @,
+// BracketRight = [, Backslash = ]. The tall L-shaped Enter uses the
+// same 1.25u x 2u approximation as ISO. Bottom row has 11 keys.
+function jisMain(y0) {
+  const y1 = y0;
+  const y2 = y0 + 1;
+  const y3 = y0 + 2;
+  const y4 = y0 + 3;
+  const y5 = y0 + 4;
+  const keys = [];
+
+  keys.push(key("Backquote", 0, y1, 1, 1, { label: "半角", subLabel: "全角" }));
+  keys.push(...rowKeys(DIGITS, 1, y1));
+  keys.push(key("Minus", 11, y1));
+  keys.push(key("Equal", 12, y1, 1, 1, { label: "^", subLabel: "~" }));
+  keys.push(key("IntlYen", 13, y1));
+  keys.push(key("Backspace", 14, y1, 1));
+
+  keys.push(key("Tab", 0, y2, 1.5));
+  keys.push(...rowKeys(LETTERS_Q, 1.5, y2));
+  keys.push(key("BracketLeft", 11.5, y2, 1, 1, { label: "@", subLabel: "`" }));
+  keys.push(key("BracketRight", 12.5, y2, 1, 1, { label: "[", subLabel: "{" }));
+  keys.push(key("Enter", 13.75, y2, 1.25, 2));
+
+  keys.push(key("CapsLock", 0, y3, 1.75));
+  keys.push(...rowKeys(LETTERS_A, 1.75, y3));
+  keys.push(key("Semicolon", 10.75, y3, 1, 1, { subLabel: "+" }));
+  keys.push(key("Quote", 11.75, y3, 1, 1, { label: ":", subLabel: "*" }));
+  keys.push(key("Backslash", 12.75, y3));
+
+  keys.push(key("ShiftLeft", 0, y4, 2.25));
+  keys.push(...rowKeys(LETTERS_Z, 2.25, y4));
+  keys.push(key("Comma", 9.25, y4));
+  keys.push(key("Period", 10.25, y4));
+  keys.push(key("Slash", 11.25, y4));
+  keys.push(key("IntlRo", 12.25, y4));
+  keys.push(key("ShiftRight", 13.25, y4, 1.75));
+
+  keys.push(key("ControlLeft", 0, y5, 1.25));
+  keys.push(key("MetaLeft", 1.25, y5, 1.25));
+  keys.push(key("AltLeft", 2.5, y5, 1.25));
+  keys.push(key("NonConvert", 3.75, y5, 1));
+  keys.push(key("Space", 4.75, y5, 3.25));
+  keys.push(key("Convert", 8, y5, 1));
+  keys.push(key("KanaMode", 9, y5, 1));
+  keys.push(key("AltRight", 10, y5, 1.25));
+  keys.push(key("MetaRight", 11.25, y5, 1.25));
+  keys.push(key("ContextMenu", 12.5, y5, 1.25));
+  keys.push(key("ControlRight", 13.75, y5, 1.25));
+  return keys;
+}
+
 function fRowStandard() {
   const keys = [key("Escape", 0, 0)];
   ["F1", "F2", "F3", "F4"].forEach((c, i) => keys.push(key(c, 2 + i, 0)));
@@ -289,16 +408,19 @@ function bounds(keys) {
 
 function layout(id, name, category, keys, extra = {}) {
   const { width, height } = bounds(keys);
+  // Field order matches the committed JSON files (hint/description
+  // after name); keep it so regenerating leaves the 5 ANSI layouts
+  // byte-identical.
   return {
     id,
     name,
+    ...extra,
     category,
     unitWidth: 54,
     gap: 5,
     width: Number(width.toFixed(3)),
     height: Number(height.toFixed(3)),
     keys,
-    ...extra,
   };
 }
 
@@ -319,6 +441,28 @@ const full = layout("fullsize-ansi", "데스크톱 키보드", "fullsize", [
 ], {
   hint: "숫자패드 있음",
   description: "숫자 키패드가 있는 일반 PC 키보드",
+});
+
+// S6: ISO 105-key fullsize (ANSI 104 - Backslash + IntlBackslash + #).
+const fullIso = layout("fullsize-iso", "데스크톱 키보드 ISO", "fullsize", [
+  ...fRowStandard(),
+  ...isoMain(1.25),
+  ...navCluster(),
+  ...numpad(),
+], {
+  hint: "숫자패드 있음 · ISO",
+  description: "ISO 배열 데스크톱 키보드 · tall Enter와 추가 키",
+});
+
+// S6: JIS 109-key fullsize (ANSI 104 + 5개 추가 키).
+const fullJis = layout("fullsize-jis", "데스크톱 키보드 JIS", "fullsize", [
+  ...fRowStandard(),
+  ...jisMain(1.25),
+  ...navCluster(),
+  ...numpad(),
+], {
+  hint: "숫자패드 있음 · JIS",
+  description: "JIS 배열 데스크톱 키보드 · 변환·무변환·かな 키",
 });
 
 function compact75() {
@@ -445,7 +589,7 @@ function compact60() {
   });
 }
 
-const layouts = [full, tkl, compact75(), compact65(), compact60()];
+const layouts = [full, tkl, compact75(), compact65(), compact60(), fullIso, fullJis];
 
 for (const l of layouts) {
   const file = join(outDir, `${l.id}.json`);
