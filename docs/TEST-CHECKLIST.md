@@ -172,3 +172,30 @@ stays in English.
    leak), and a translated banner explains that live key display may not
    update.
 2. In all three languages (EN/KO/JA), check the banner text renders.
+
+## Test 17 — Fresh install (HF-08)
+
+1. On a clean Windows machine (state the OS: Win10 / Win11, build), run
+   the NSIS installer (`KeyGlow_0.1.1_x64-setup.exe`) as a normal user.
+   Expected: per-user install completes, app starts, tray icon appears,
+   keyboard filtering works in Notepad.
+2. Run the portable exe (`keyglow.exe`) from a folder without installing.
+   Expected: same behavior, no files written outside the config dir and
+   the exe's own folder.
+3. Record the OS build that was actually tested. Never mark an untested
+   OS as verified.
+
+## Test 18 — Upgrade over v0.1.0, settings preserved (HF-08)
+
+1. Install v0.1.0, disable a few keys, create a custom profile, enable
+   start-with-Windows.
+2. Install the new version over it (NSIS upgrade).
+   Expected: `settings.json` is preserved — disabled keys, profiles,
+   layout, language, theme, and autostart setting are all intact.
+3. Corrupt `settings.json` by hand, then start the app.
+   Expected: app starts with defaults, the corrupt file is backed up
+   (`.bak`), no crash, input works.
+4. Tray Exit, then force-kill the process while keys are disabled.
+   Expected: no stuck keys after either; the low-level hook is released.
+5. Sleep/resume with the app running.
+   Expected: filtering resumes; no ghost pressed keys (see Test 14).

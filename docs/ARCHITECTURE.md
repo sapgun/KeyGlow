@@ -178,3 +178,26 @@ physical input state is never rolled back because the disk write failed.
 - Event subscription uses `Promise.allSettled`: a single failing listener
   no longer leaks the already-registered ones, and the failure is shown in
   a translated banner (HF-09 follow-up).
+
+## ADR: Content Security Policy (deferred — HF-09)
+
+`tauri.conf.json` ships with `csp: null`, meaning Tauri injects no CSP.
+This is a deliberate deferral, not an oversight:
+
+- The frontend (`index.html` + Vite production bundle) uses no inline
+  scripts and no `innerHTML`/`dangerouslySetInnerHTML`, so a strict policy
+  like `default-src 'self'` is *plausible*.
+- But Tauri v2 IPC and the asset protocol have scheme requirements that
+  can only be confirmed against a real Windows build. Applying a guessed
+  CSP risks silently breaking IPC or the keyboard UI with no test catching
+  it on this branch.
+- Decision: keep `csp: null` until a Windows `tauri build` exists, then
+  apply the minimal verified policy and smoke-test every IPC command
+  (`get_pressed_snapshot`, profile CRUD, autostart, locale/theme) plus the
+  Cat Lock and emergency flows before keeping it.
+
+Candidate policy to verify (do not apply blind):
+`default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'`
+(`unsafe-inline` for styles only, because Tailwind/runtime style
+attributes may need it — confirm during the real-build verification and
+tighten if possible).
