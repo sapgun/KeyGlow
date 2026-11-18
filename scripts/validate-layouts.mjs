@@ -19,16 +19,19 @@ const EXPECTED_LAYOUTS = [
   "fullsize-jis",
 ];
 
-// S6: golden SHA-256 of the 5 ANSI layout files. Any regeneration that
-// changes a key count, coordinate, or id fails here. Recompute only
-// after a deliberate, reviewed ANSI change:
-//   sha256sum src/layouts/{fullsize,tkl,75,65,60}-ansi.json
+// S6: golden SHA-256 of the 5 ANSI layouts. Any regeneration that
+// changes a key count, coordinate, or id fails here. The hash is taken
+// over JSON.stringify of the parsed layout, not the raw file bytes, so
+// line endings (LF on Linux, CRLF after a Windows checkout) and
+// trailing whitespace do not matter. Recompute only after a
+// deliberate, reviewed ANSI change:
+//   node -e 'const fs=require("fs"),c=require("node:crypto");for(const f of ["fullsize","tkl","75","65","60"])console.log(f, c.createHash("sha256").update(JSON.stringify(JSON.parse(fs.readFileSync(`src/layouts/${f}-ansi.json`,"utf8")))).digest("hex"))'
 const ANSI_GOLDEN = {
-  "fullsize-ansi": "05186728c57f904244af7c6f9db1422659ab3980562e81f19696a9e30907407f",
-  "tkl-ansi": "dca5ca802f36ad67adb2d3ba1cd951898a6ab972d3bfdb41a47317e4d581d832",
-  "75-ansi": "4e6857010a3f9dae6f2e928315aae053ea07e6a8bb6e411641be97f5bbb2f43f",
-  "65-ansi": "620ff1b94aa2e20f5216127c7e3a4fa9b42c9bb31517829d1cf4b59fa50bc03b",
-  "60-ansi": "aaae3ba9fe92eb0e08e9010ee6fa8e3b5d791a6f084fa50edf55e05340ad5a2b",
+  "fullsize-ansi": "468fff35965f94abc0e2f8fe2347a1725898f855b154d42887ed11a8271c382f",
+  "tkl-ansi": "6a024c4cd54428857e4f3f0030fa5509a7d15ba1bbc57cea4cb903433f40c447",
+  "75-ansi": "f410071496e06d5d851f165a7dbb40deb3000b533d74991b3be9f28fd2f98f84",
+  "65-ansi": "1ffa027d8eb2d5534b473335e5cb9a46facec8681fb4f4397d1dbb303ccad6f3",
+  "60-ansi": "f519e1559418f6929c3d96bcc56d720993f8bccf1d770961269350509bfc33b0",
 };
 
 // S6: expected key counts and required extra keys per layout.
@@ -103,9 +106,11 @@ for (const file of files) {
       throw new Error(`${layout.id}: missing required label ${label}`);
     }
   }
-  // S6: golden hash pins the 5 ANSI layouts byte-for-byte.
+  // S6: golden hash pins the 5 ANSI layouts. Hash the normalized
+  // content (see ANSI_GOLDEN), not the raw bytes, so a Windows
+  // checkout (CRLF) passes exactly like a Linux one (LF).
   if (ANSI_GOLDEN[layout.id]) {
-    const hash = createHash("sha256").update(raw).digest("hex");
+    const hash = createHash("sha256").update(JSON.stringify(layout)).digest("hex");
     if (hash !== ANSI_GOLDEN[layout.id]) {
       throw new Error(
         `${layout.id}: golden hash mismatch (got ${hash}); ` +

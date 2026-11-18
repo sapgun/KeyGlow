@@ -355,8 +355,8 @@ Physical (needs the rig):
 ## Test 22 — ISO/JIS layouts and layout import (S6)
 
 Automated (layout validation in `scripts/validate-layouts.mjs`, 7
-layouts incl. golden SHA-256 hashes pinning the 5 ANSI files
-byte-for-byte; catalog sync in `scripts/test-catalog-sync.mjs` and
+layouts incl. golden SHA-256 content hashes pinning the 5 ANSI files
+(line-ending-insensitive, so a Windows CRLF checkout passes); catalog sync in `scripts/test-catalog-sync.mjs` and
 `keycodes.rs::catalog_matches_ts_key_catalog`, 110 codes in Rust,
 META, and the TS catalog; import validation in
 `scripts/test-layout-import.mjs`, 18 assertions, and
