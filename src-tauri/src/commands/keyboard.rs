@@ -48,6 +48,7 @@ pub fn set_key_enabled(
     code: String,
     enabled: bool,
 ) -> Result<Vec<String>, String> {
+    let entered = state.safety_epoch();
     let key = KeyCode::from_id(&code).ok_or_else(|| format!("unknown key: {code}"))?;
     if enabled {
         state.controller.enable_key(key);
@@ -66,7 +67,18 @@ pub fn set_key_enabled(
             }
         }
     }
+    if state.safety.epoch() != entered {
+        // Emergency press landed mid-command: discard, never persist stale.
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(state.snapshot_disabled());
+    }
     state.persist()?;
+    if state.safety.epoch() != entered {
+        // Emergency press landed during persist: the stale write may have
+        // beaten the worker's convergence to disk; force safe state back.
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return Ok(state.snapshot_disabled());
+    }
     let disabled = state.snapshot_disabled();
     let _ = app.emit("keyboard:state-changed", &disabled);
     Ok(disabled)
@@ -74,6 +86,7 @@ pub fn set_key_enabled(
 
 #[tauri::command]
 pub fn enable_all_keys(app: AppHandle, state: State<AppState>) -> Result<Vec<String>, String> {
+    let entered = state.safety_epoch();
     state.controller.enable_all();
     {
         let mut cfg = state.config.lock();
@@ -81,7 +94,15 @@ pub fn enable_all_keys(app: AppHandle, state: State<AppState>) -> Result<Vec<Str
             profile.disabled_keys.clear();
         }
     }
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(state.snapshot_disabled());
+    }
     state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return Ok(state.snapshot_disabled());
+    }
     let disabled = state.snapshot_disabled();
     let _ = app.emit("keyboard:state-changed", &disabled);
     let _ = app.emit("keyboard:cat-lock", false);
@@ -91,7 +112,13 @@ pub fn enable_all_keys(app: AppHandle, state: State<AppState>) -> Result<Vec<Str
 
 #[tauri::command]
 pub fn set_cat_lock(app: AppHandle, state: State<AppState>, locked: bool) -> Result<bool, String> {
+    let entered = state.safety_epoch();
     state.controller.set_cat_lock(locked);
+    if state.safety.epoch() != entered {
+        // A stale lock/unlock must not override the post-emergency state.
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(false);
+    }
     let _ = app.emit("keyboard:cat-lock", locked);
     crate::tray::refresh(&app);
     tracing::info!(locked, "cat lock");

@@ -51,6 +51,41 @@ Hold `W`. The virtual `W` should glow and depress. Release: glow gone.
 
 Disable several keys. Press `Ctrl + Shift + F12`. Expected: all keys enabled, notice shown, Default profile selected.
 
+## Test 7b — Emergency unlock under a saturated event queue (HF-01)
+
+Goal: prove the unlock converges even when the `EmergencyUnlock` queue event is dropped.
+
+1. Disable several keys and turn on Cat Lock.
+2. Stall the UI event consumer (e.g. break into the debugger on the main thread, or hold the main thread busy) so the bounded event queue fills and `try_send` starts dropping.
+3. Press `Ctrl + Shift + F12`.
+4. Expected: physical input recovers immediately (type in Notepad at once). After the UI thread resumes: notice shown, Default profile selected, all keys enabled, Cat Lock off, tray menu refreshed. `settings.json` on disk holds the converged state.
+5. Regression check: no duplicate persists per single press in the log (one `emergency unlock converged` line).
+
+## Test 7c — Stale command after emergency (HF-01)
+
+Goal: an in-flight profile/key-disable command must not re-disable keys after the unlock.
+
+1. Disable several keys on the Gaming profile and select it.
+2. Start a profile switch (or a key toggle) and press `Ctrl + Shift + F12` while the command is in flight. Manual approximation: invoke `select_profile` for Gaming from the tray menu, then immediately hit the chord.
+3. Expected: Default profile selected, all keys enabled, notice shown. The stale command's disabled set is discarded, not applied.
+4. Restart the app. Expected: Default profile, all keys still enabled (no stale disable set resurrected from disk).
+
+## Test 7d — Emergency with unwritable settings (HF-01)
+
+Goal: physical recovery must not depend on config persist.
+
+1. Make `settings.json` unwritable (read-only file, or read-only config dir).
+2. Disable several keys. Press `Ctrl + Shift + F12`.
+3. Expected: all keys enabled immediately; an error is logged (`settings persist failed ... input remains enabled`) instead of silently dropped. Keys stay enabled.
+
+## Test 7e — Emergency edge cases
+
+- With `Ctrl`, `Shift`, or `F12` themselves disabled in the profile: the chord still fires (evaluated from physical state).
+- During Cat Lock: the chord fires and clears the lock.
+- Holding a modifier mid-hold, then completing the chord: no stuck modifier afterwards (release still forwards the up).
+- Five rapid chord presses: single convergence per press, no duplicate UI notices stacking, queue stays bounded.
+- Chord immediately followed by a fresh key-disable: the fresh (post-emergency) command applies normally.
+
 ## Test 8 — Exit restores input
 
 Disable `A`. Choose tray **Exit**. Press `A` in Notepad. Expected: `A` types. The hook is gone with the process.

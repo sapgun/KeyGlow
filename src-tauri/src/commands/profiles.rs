@@ -11,6 +11,7 @@ pub fn get_profiles(state: State<AppState>) -> Vec<Profile> {
 
 #[tauri::command]
 pub fn select_profile(app: AppHandle, state: State<AppState>, id: String) -> Result<Profile, String> {
+    let entered = state.safety_epoch();
     {
         let mut cfg = state.config.lock();
         if cfg.profile(&id).is_none() {
@@ -21,8 +22,17 @@ pub fn select_profile(app: AppHandle, state: State<AppState>, id: String) -> Res
             cfg.selected_layout = layout;
         }
     }
+    if state.safety.epoch() != entered {
+        // Stale selection must not re-apply a disabled set after the unlock.
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return converged_profile(&state);
+    }
     state.apply_current_profile();
     state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return converged_profile(&state);
+    }
     tracing::info!("profile selected: {id}");
     let profile = state
         .config
@@ -34,6 +44,17 @@ pub fn select_profile(app: AppHandle, state: State<AppState>, id: String) -> Res
     let _ = app.emit("keyboard:state-changed", state.snapshot_disabled());
     tray::refresh(&app);
     Ok(profile)
+}
+
+/// Authoritative profile after emergency convergence (Default when present).
+/// Returned by stale profile commands so callers report converged state.
+fn converged_profile(state: &AppState) -> Result<Profile, String> {
+    state
+        .config
+        .lock()
+        .current_profile()
+        .cloned()
+        .ok_or_else(|| "profile missing after emergency converge".to_string())
 }
 
 #[tauri::command]
@@ -55,10 +76,21 @@ pub fn create_profile(
         disabled_keys: vec![],
         builtin: false,
     };
+    let entered = state.safety_epoch();
     state.config.lock().profiles.push(profile.clone());
     state.config.lock().selected_profile = id;
+    if state.safety.epoch() != entered {
+        // The profile itself is harmless (no disabled keys); only the
+        // selection is reverted to the safe state.
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(profile);
+    }
     state.apply_current_profile();
     state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return Ok(profile);
+    }
     let _ = app.emit("profile:changed", state.config.lock().clone());
     tray::refresh(&app);
     Ok(profile)
@@ -83,10 +115,21 @@ pub fn duplicate_profile(
         disabled_keys: source.disabled_keys,
         builtin: false,
     };
+    let entered = state.safety_epoch();
     state.config.lock().profiles.push(copy.clone());
     state.config.lock().selected_profile = copy.id.clone();
+    if state.safety.epoch() != entered {
+        // A stale duplicate may carry a disabled set; never apply it after
+        // the unlock. The copy itself stays in the list, unselected.
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(copy);
+    }
     state.apply_current_profile();
     state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return Ok(copy);
+    }
     let _ = app.emit("profile:changed", state.config.lock().clone());
     tray::refresh(&app);
     Ok(copy)
@@ -127,6 +170,7 @@ pub fn delete_profile(app: AppHandle, state: State<AppState>, id: String) -> Res
     if id == DEFAULT_PROFILE_ID {
         return Err("the Default profile cannot be deleted".into());
     }
+    let entered = state.safety_epoch();
     {
         let mut cfg = state.config.lock();
         if cfg.profiles.len() <= 1 {
@@ -143,8 +187,16 @@ pub fn delete_profile(app: AppHandle, state: State<AppState>, id: String) -> Res
             }
         }
     }
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return Ok(());
+    }
     state.apply_current_profile();
     state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return Ok(());
+    }
     let _ = app.emit("profile:changed", state.config.lock().clone());
     let _ = app.emit("keyboard:state-changed", state.snapshot_disabled());
     tray::refresh(&app);
@@ -153,6 +205,7 @@ pub fn delete_profile(app: AppHandle, state: State<AppState>, id: String) -> Res
 
 #[tauri::command]
 pub fn reset_profile(app: AppHandle, state: State<AppState>, id: String) -> Result<Profile, String> {
+    let entered = state.safety_epoch();
     {
         let mut cfg = state.config.lock();
         let profile = cfg
@@ -164,6 +217,11 @@ pub fn reset_profile(app: AppHandle, state: State<AppState>, id: String) -> Resu
             profile.disabled_keys.clear();
         }
     }
+    if state.safety.epoch() != entered {
+        // A stale reset must not re-apply a disabled set after the unlock.
+        crate::discard_stale_command(&app, &state, "superseded mid-command");
+        return converged_profile(&state);
+    }
     if state.config.lock().selected_profile == id {
         let keys = {
             let cfg = state.config.lock();
@@ -174,6 +232,10 @@ pub fn reset_profile(app: AppHandle, state: State<AppState>, id: String) -> Resu
         state.controller.set_disabled_keys(&keys);
     }
     state.persist()?;
+    if state.safety.epoch() != entered {
+        crate::discard_stale_command(&app, &state, "superseded during persist");
+        return converged_profile(&state);
+    }
     let profile = state
         .config
         .lock()
